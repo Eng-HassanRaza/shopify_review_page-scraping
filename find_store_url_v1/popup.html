@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Find Store URL</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h2>Find Store URL</h2>
+      <div class="progress">
+        <span id="progress-text">Loading...</span>
+      </div>
+    </div>
+
+    <div class="store-info" id="store-info">
+      <div class="store-name" id="store-name">Loading store...</div>
+      <div class="store-country" id="store-country"></div>
+    </div>
+
+    <div class="controls">
+      <button id="search-btn" class="btn btn-primary">Search Google</button>
+      <button id="skip-btn" class="btn btn-secondary">Skip Store</button>
+    </div>
+
+    <div class="settings">
+      <label class="checkbox-label">
+        <input type="checkbox" id="auto-search-toggle" checked>
+        <span>Auto-search next store after saving URL</span>
+      </label>
+    </div>
+
+    <div class="url-section" id="url-section" style="display: none;">
+      <label for="found-url">Found URL:</label>
+      <input type="url" id="found-url" placeholder="https://example.com" />
+      <div class="url-buttons">
+        <button id="capture-current-btn" class="btn btn-info">Use Current Page URL</button>
+        <button id="save-btn" class="btn btn-success">Save URL</button>
+        <button id="cancel-btn" class="btn btn-secondary">Cancel</button>
+      </div>
+    </div>
+
+    <div class="status" id="status"></div>
+
+    <div class="footer">
+      <button id="load-data-btn" class="btn btn-outline">Load JSON Data</button>
+      <button id="test-button-btn" class="btn btn-outline">Test Button</button>
+      <button id="clear-button-btn" class="btn btn-outline">Clear Button</button>
+      <button id="export-btn" class="btn btn-outline">Export Progress</button>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,43 @@
+{
+  "manifest_version": 3,
+  "name": "Shopify Store URL Finder",
+  "version": "1.0.0",
+  "description": "Helps find store URLs from Google search results for Shopify Review Processor",
+  "permissions": [
+    "tabs",
+    "activeTab",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://www.google.com/*",
+    "http://localhost:5001/*",
+    "http://127.0.0.1:5001/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://www.google.com/search*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["http://localhost:5001/*", "http://127.0.0.1:5001/*"],
+      "js": ["flask_content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["bridge.html"],
+      "matches": ["<all_urls>"]
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Shopify Store URL Finder"
+  }
+}
+

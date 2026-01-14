@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Shopify Review Processor</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <div>
+                    <h1>Shopify Review Processor</h1>
+                    <p>Unified workflow for scraping reviews, finding store URLs, and extracting emails</p>
+                </div>
+                <a href="/data" style="color: #3498db; text-decoration: none; font-weight: 500; padding: 10px 20px; border: 2px solid #3498db; border-radius: 4px;">View Data →</a>
+            </div>
+        </header>
+
+        <div class="main-content">
+            <div class="section">
+                <h2>Step 1: Start Review Scraping</h2>
+                <div class="input-group">
+                    <input type="text" id="app-url" placeholder="Enter Shopify App Review URL (e.g., https://apps.shopify.com/app-name/reviews)">
+                    <button id="start-scraping">Start Scraping</button>
+                </div>
+                <div style="margin-top: 15px; padding: 15px; background: #f8f9fa; border-radius: 4px;">
+                    <p style="margin: 0 0 10px 0; font-size: 14px; color: #666;"><strong>Optional Limits:</strong> Set limits to scrape in batches</p>
+                    <div style="display: flex; gap: 15px; flex-wrap: wrap;">
+                        <div style="flex: 1; min-width: 200px;">
+                            <label for="max-reviews" style="display: block; margin-bottom: 5px; font-size: 13px;">Max Reviews:</label>
+                            <input type="number" id="max-reviews" placeholder="Leave empty for unlimited" min="1" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                        </div>
+                        <div style="flex: 1; min-width: 200px;">
+                            <label for="max-pages" style="display: block; margin-bottom: 5px; font-size: 13px;">Max Pages:</label>
+                            <input type="number" id="max-pages" placeholder="Leave empty for unlimited" min="1" style="width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px;">
+                        </div>
+                    </div>
+                    <p style="margin: 10px 0 0 0; font-size: 12px; color: #999;">Note: If both limits are set, scraping stops when either limit is reached. Remaining reviews/pages will be scraped next time you paste the same URL.</p>
+                </div>
+                <div style="margin-top: 15px; padding: 15px; background: #fff3cd; border: 1px solid #ffc107; border-radius: 4px;">
+                    <p style="margin: 0 0 10px 0; font-size: 14px; color: #856404;"><strong>Email Scraper Service URL:</strong></p>
+                    <div style="display: flex; gap: 10px; align-items: center;">
+                        <input type="text" id="email-service-url" placeholder="http://localhost:5002" style="flex: 1; padding: 8px; border: 1px solid #ddd; border-radius: 4px;" value="http://localhost:5002">
+                        <button id="save-email-service-url" style="padding: 8px 15px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer;">Save</button>
+                    </div>
+                    <p style="margin: 10px 0 0 0; font-size: 12px; color: #856404;">Configure the URL of your Email Scraper Service. Local: http://localhost:5002, Cloud: http://your-server:5000</p>
+                </div>
+                <div id="job-status" class="status"></div>
+                <div id="progress-section" style="display: none; margin-top: 20px;">
+                    <div class="progress-bar-container">
+                        <div class="progress-bar" id="progress-bar"></div>
+                    </div>
+                    <div id="progress-message" class="progress-message"></div>
+                    <div id="progress-details" class="progress-details"></div>
+                </div>
+            </div>
+
+            <div class="section">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                    <h2 style="margin: 0;">Step 2: Find Store URLs</h2>
+                    <div style="display: flex; gap: 15px; align-items: center;">
+                        <label class="auto-mode-toggle" id="auto-mode-toggle">
+                            <input type="checkbox" id="auto-mode-checkbox">
+                            <span class="toggle-slider"></span>
+                            <span class="toggle-label">Auto Mode</span>
+                        </label>
+                        <label class="auto-mode-toggle" id="ai-auto-select-toggle">
+                            <input type="checkbox" id="ai-auto-select-checkbox">
+                            <span class="toggle-slider"></span>
+                            <span class="toggle-label">AI Auto Select</span>
+                        </label>
+                        <button id="start-url-finding" class="btn-small" style="display: none; background: #27ae60; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: 500;">▶ Start URL Finding</button>
+                        <button id="stop-url-finding" class="btn-small" style="display: none; background: #e74c3c; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: 500;">⏸ Stop URL Finding</button>
+                    </div>
+                </div>
+                <div id="stores-container">
+                    <p>No stores pending. Start scraping reviews first.</p>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>Statistics</h2>
+                <div id="statistics" class="stats-grid">
+                    <div class="stat-item">
+                        <span class="stat-label">Total Stores</span>
+                        <span class="stat-value" id="total-stores">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Pending URL</span>
+                        <span class="stat-value" id="pending-url">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">URL Verified</span>
+                        <span class="stat-value" id="url-verified">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Emails Found</span>
+                        <span class="stat-value" id="emails-found">0</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="section">
+                <h2>Export Data</h2>
+                <button id="export-json">Export JSON</button>
+                <button id="export-csv">Export CSV</button>
+            </div>
+        </div>
+    </div>
+
+    <div id="modal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h3 id="modal-title">Store URL Verification</h3>
+            <div id="modal-body"></div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}"></script>
+</body>
+</html>
+

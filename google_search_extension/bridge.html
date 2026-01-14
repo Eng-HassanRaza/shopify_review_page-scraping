@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Extension Bridge</title>
+</head>
+<body>
+  <script>
+    // Bridge page that communicates between Flask and Extension
+    // Flask opens this page with query parameter
+    const urlParams = new URLSearchParams(window.location.search);
+    const query = urlParams.get('query');
+    
+    if (query) {
+      // Send message to extension background script
+      chrome.runtime.sendMessage({
+        action: 'search',
+        query: decodeURIComponent(query)
+      }, (response) => {
+        if (response && response.success) {
+          // Send results back to Flask
+          fetch('http://localhost:5001/api/search/results', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              query: query,
+              urls: response.urls
+            })
+          }).then(() => {
+            document.body.innerHTML = '<h2>Search complete! Results sent to Flask app.</h2><p>You can close this tab.</p>';
+          }).catch(err => {
+            document.body.innerHTML = '<h2>Error sending results</h2><p>' + err.message + '</p>';
+          });
+        } else {
+          document.body.innerHTML = '<h2>Search failed</h2><p>' + (response?.error || 'Unknown error') + '</p>';
+        }
+      });
+    } else {
+      document.body.innerHTML = '<h2>No query provided</h2>';
+    }
+  </script>
+</body>
+</html>
+
