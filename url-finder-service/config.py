@@ -4,8 +4,23 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
-env_path = Path(__file__).parent.parent.parent / '.env'
-load_dotenv(dotenv_path=env_path)
+# Try multiple locations: current directory, parent directory, project root
+env_paths = [
+    Path(__file__).parent / '.env',  # url-finder-service/.env
+    Path(__file__).parent.parent / '.env',  # shopify_review_page-scraping/.env
+    Path(__file__).parent.parent.parent / '.env',  # parent of project root
+]
+
+env_loaded = False
+for env_path in env_paths:
+    if env_path.exists():
+        load_dotenv(dotenv_path=env_path, override=True)
+        env_loaded = True
+        break
+
+# Also try loading from current directory (for compatibility)
+if not env_loaded:
+    load_dotenv(override=True)
 
 # Database - Shared PostgreSQL
 DB_HOST = os.getenv('DB_HOST', 'localhost')
