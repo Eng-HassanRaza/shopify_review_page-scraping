@@ -196,22 +196,10 @@ All other API calls go to the local URL Finder Service.
 
 ```
 project/
-├── url-finder-service/
-│   ├── app.py              # Flask app (URL finding)
-│   ├── config.py           # Configuration
-│   ├── database.py         # Database module (shared)
-│   ├── modules/            # URL finding modules
-│   ├── templates/          # Frontend HTML
-│   ├── static/             # Frontend JS/CSS
-│   └── requirements.txt    # Dependencies
-│
-├── email-scraper-service/
-│   ├── app.py              # Flask app (Email scraping)
-│   ├── config.py           # Configuration
-│   ├── database.py         # Database module (shared)
-│   ├── modules/            # Email scraping modules
-│   └── requirements.txt    # Dependencies
-│
+├── url-finder-service/     # Local Flask app (URL finding, UI)
+├── email-scraper-service/  # Cloud Flask app (Email scraping)
+├── google_search_extension/ # Chrome extension for Google search
+├── MICROSERVICES_SETUP.md
 └── .env                    # Shared environment variables
 ```
 

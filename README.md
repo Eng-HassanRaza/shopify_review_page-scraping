@@ -1,53 +1,36 @@
 # Shopify Review Processor
 
-Unified web application for scraping Shopify app reviews, finding store URLs, and extracting emails.
-
-## Quick Start
-
-1. **Install dependencies:**
-```bash
-pip install -r shopify_processor/requirements.txt
-playwright install chromium
-```
-
-2. **Start the application:**
-```bash
-cd shopify_processor
-python app.py
-```
-
-3. **Open your browser:**
-Navigate to `http://127.0.0.1:5000`
-
-## Features
-
-- **Review Scraping**: Automatically scrape reviews from Shopify App Store pages
-- **URL Finding**: Search Google and verify store URLs using browser automation
-- **Email Extraction**: Scrape emails from verified store websites
-- **Progress Tracking**: SQLite database tracks all progress
-- **Web Interface**: Clean, modern web UI for managing the workflow
-- **Export**: Export data as JSON or CSV
-
-## Workflow
-
-1. Enter a Shopify App Review URL (e.g., `https://apps.shopify.com/app-name/reviews`)
-2. Click "Start Scraping" - reviews are automatically scraped
-3. For each store, click "Find URL" to search Google
-4. Select the correct store URL from search results
-5. Emails are automatically scraped after URL verification
-6. Export your data when complete
+Microservices application for scraping Shopify app reviews, finding store URLs, and extracting emails.
 
 ## Architecture
 
-- **Backend**: Flask web server
-- **Database**: SQLite for persistent storage
-- **Browser Automation**: Playwright for Google search
-- **Email Scraping**: Async aiohttp for efficient scraping
+- **URL Finder Service** (`url-finder-service/`) — Local. Review scraping, URL finding via Chrome extension, AI URL selection, frontend UI. Port 5001.
+- **Email Scraper Service** (`email-scraper-service/`) — Cloud or local. Email scraping, AI extraction, queue processing. Port 5002 (local) / 5000 (cloud).
+- **Chrome Extension** (`google_search_extension/`) — Load in Chrome for Google search automation.
+
+Both services share a PostgreSQL database (e.g. AWS RDS).
+
+## Quick Start
+
+1. **Load Chrome extension:** `chrome://extensions/` → Load unpacked → select `google_search_extension/`
+
+2. **Start Email Scraper Service:**
+```bash
+cd email-scraper-service
+pip install -r requirements.txt
+python app.py
+```
+
+3. **Start URL Finder Service:**
+```bash
+cd url-finder-service
+pip install -r requirements.txt
+playwright install chromium
+python app.py
+```
+
+4. **Open UI:** `http://127.0.0.1:5001` — Set Email Scraper URL to `http://localhost:5002`
 
 ## Configuration
 
-Edit `shopify_processor/config.py` to adjust server settings, browser behavior, and scraping parameters.
-
-## Backup
-
-The `find_store_url_v1/` directory contains the previous Chrome extension implementation as a backup.
+Create `.env` in project root or service directories. See `MICROSERVICES_SETUP.md` for full setup, deployment, and troubleshooting.

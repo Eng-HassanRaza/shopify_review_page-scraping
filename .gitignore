@@ -153,9 +153,6 @@ Desktop.ini
 *.db-journal
 
 # Project-specific data files
-shopify_processor/data/*.db
-shopify_processor/data/*.sqlite
-shopify_processor/data/*.sqlite3
 *.csv
 shopify_reviews.csv
 test_reviews.csv
