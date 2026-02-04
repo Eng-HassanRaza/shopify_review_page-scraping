@@ -72,16 +72,16 @@ def health_check():
         'max_concurrent': MAX_CONCURRENT_EMAIL_SCRAPING
     })
 
-def start_next_email_scraping_job():
-    """Start the next pending store email scraping if we have capacity"""
+def start_next_email_scraping_job(app_name=None):
+    """Start the next pending store email scraping if we have capacity. Optionally only for app_name."""
     with email_scraping_lock:
         active_count = len(active_email_scraping_jobs)
         if active_count >= MAX_CONCURRENT_EMAIL_SCRAPING:
             return None  # Already at capacity
         active_store_ids_set = set(active_email_scraping_jobs)
     
-    # Get multiple pending stores and filter out already active ones
-    pending_stores = db.get_stores_with_urls_no_emails(limit=MAX_CONCURRENT_EMAIL_SCRAPING * 2)
+    # Get multiple pending stores and filter out already active ones (optionally for one app)
+    pending_stores = db.get_stores_with_urls_no_emails(limit=MAX_CONCURRENT_EMAIL_SCRAPING * 2, app_name=app_name)
     if not pending_stores:
         return None  # No more stores to process
     
@@ -200,8 +200,12 @@ def start_next_email_scraping_job():
 
 @app.route('/api/email-scraping/start-next-job', methods=['POST'])
 def start_next_email_scraping_job_endpoint():
-    """API endpoint to start the next email scraping job if capacity available"""
-    result = start_next_email_scraping_job()
+    """API endpoint to start the next email scraping job if capacity available. Optional app_name in JSON body."""
+    data = request.get_json(silent=True) or {}
+    app_name = data.get('app_name') or request.args.get('app_name')
+    if app_name and isinstance(app_name, str):
+        app_name = app_name.strip() or None
+    result = start_next_email_scraping_job(app_name=app_name)
     if result:
         return jsonify(result)
     else:
@@ -216,14 +220,18 @@ def start_next_email_scraping_job_endpoint():
 
 @app.route('/api/email-scraping/batch/start', methods=['POST'])
 def start_batch_email_scraping():
-    """Start continuous email scraping: always keep stores processing"""
+    """Start continuous email scraping: always keep stores processing. Optional app_name in JSON to scope to one app."""
+    data = request.get_json(silent=True) or {}
+    app_name = data.get('app_name') or request.args.get('app_name')
+    if app_name and isinstance(app_name, str):
+        app_name = app_name.strip() or None
     with email_scraping_lock:
         active_count = len(active_email_scraping_jobs)
         active_store_ids_set = set(active_email_scraping_jobs)
     
-    # Get pending stores - get enough for all available slots
+    # Get pending stores - get enough for all available slots (optionally for one app)
     jobs_to_start = min(MAX_CONCURRENT_EMAIL_SCRAPING - active_count, MAX_CONCURRENT_EMAIL_SCRAPING)
-    pending_stores = db.get_stores_with_urls_no_emails(limit=jobs_to_start * 2)
+    pending_stores = db.get_stores_with_urls_no_emails(limit=jobs_to_start * 2, app_name=app_name)
     
     # Filter out stores that are already active
     truly_pending = [s for s in pending_stores if s['id'] not in active_store_ids_set]
@@ -358,61 +366,74 @@ def start_batch_email_scraping():
 
 @app.route('/api/email-scraping/batch/status', methods=['GET'])
 def get_batch_email_scraping_status():
-    """Get status of continuous email scraping"""
+    """Get status of continuous email scraping. Optional app_name query param to scope to one app."""
+    app_name = request.args.get('app_name')
+    if app_name and isinstance(app_name, str):
+        app_name = app_name.strip() or None
     with email_scraping_lock:
         active_count = len(active_email_scraping_jobs)
         active_store_ids = list(active_email_scraping_jobs)
     
-    # Get stores with URLs but no emails (pending)
-    pending_stores = db.get_stores_with_urls_no_emails()
+    # Get stores with URLs but no emails (pending), optionally for one app
+    pending_stores = db.get_stores_with_urls_no_emails(app_name=app_name)
     pending_count = len(pending_stores)
     
-    # Get active store details
+    # Get active store details (optionally filter by app_name for scoped view)
     active_stores = []
     for store_id in active_store_ids:
         store = db.get_store(store_id)
         if store:
+            if app_name and store.get('app_name') != app_name:
+                continue
             if store.get('emails'):
                 try:
                     store['emails'] = json.loads(store['emails'])
-                except:
+                except Exception:
                     store['emails'] = []
             else:
                 store['emails'] = []
             if store.get('raw_emails'):
                 try:
                     store['raw_emails'] = json.loads(store['raw_emails'])
-                except:
+                except Exception:
                     store['raw_emails'] = []
             else:
                 store['raw_emails'] = []
             active_stores.append(store)
         else:
+            if not app_name:
+                active_stores.append({
+                    'id': store_id,
+                    'store_name': f'Store {store_id} (Loading...)',
+                    'base_url': None,
+                    'emails': [],
+                    'raw_emails': []
+                })
             logger.warning(f"Store {store_id} is in active_email_scraping_jobs but not found in database")
-            active_stores.append({
-                'id': store_id,
-                'store_name': f'Store {store_id} (Loading...)',
-                'base_url': None,
-                'emails': [],
-                'raw_emails': []
-            })
     
     # Filter out stores that are already active from pending list
     pending_store_ids = {s['id'] for s in pending_stores}
     active_store_ids_set = set(active_store_ids)
     truly_pending = [s for s in pending_stores if s['id'] not in active_store_ids_set]
     
-    # Get completed stores (recently finished, last 10)
+    # Get completed stores (recently finished, last 10), optionally for one app
     conn = db.get_connection()
     cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cursor.execute("""
-        SELECT * FROM stores
-        WHERE status = 'emails_found' OR status = 'no_emails_found'
-        ORDER BY emails_scraped_at DESC
-        LIMIT 10
-    """)
+    if app_name:
+        cursor.execute("""
+            SELECT * FROM stores
+            WHERE app_name = %s AND (status = 'emails_found' OR status = 'no_emails_found')
+            ORDER BY emails_scraped_at DESC
+            LIMIT 10
+        """, (app_name,))
+    else:
+        cursor.execute("""
+            SELECT * FROM stores
+            WHERE status = 'emails_found' OR status = 'no_emails_found'
+            ORDER BY emails_scraped_at DESC
+            LIMIT 10
+        """)
     completed_rows = cursor.fetchall()
-    conn.close()
     
     completed_stores = []
     for row in completed_rows:
@@ -420,27 +441,32 @@ def get_batch_email_scraping_status():
         if store.get('emails'):
             try:
                 store['emails'] = json.loads(store['emails'])
-            except:
+            except Exception:
                 store['emails'] = []
         else:
             store['emails'] = []
         if store.get('raw_emails'):
             try:
                 store['raw_emails'] = json.loads(store['raw_emails'])
-            except:
+            except Exception:
                 store['raw_emails'] = []
         else:
             store['raw_emails'] = []
         completed_stores.append(store)
     
-    # Get total counts for progress
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM stores WHERE base_url IS NOT NULL AND base_url != ''")
-    total_with_urls = cursor.fetchone()[0]
+    # Get total counts for progress (optionally for one app)
+    cursor2 = conn.cursor()
+    if app_name:
+        cursor2.execute("SELECT COUNT(*) FROM stores WHERE app_name = %s AND base_url IS NOT NULL AND base_url != ''", (app_name,))
+    else:
+        cursor2.execute("SELECT COUNT(*) FROM stores WHERE base_url IS NOT NULL AND base_url != ''")
+    total_with_urls = cursor2.fetchone()[0]
     
-    cursor.execute("SELECT COUNT(*) FROM stores WHERE status = 'pending_url'")
-    pending_url_count = cursor.fetchone()[0]
+    if app_name:
+        cursor2.execute("SELECT COUNT(*) FROM stores WHERE app_name = %s AND status = 'pending_url'", (app_name,))
+    else:
+        cursor2.execute("SELECT COUNT(*) FROM stores WHERE status = 'pending_url'")
+    pending_url_count = cursor2.fetchone()[0]
     conn.close()
     
     progress_percent = round((len(completed_stores) / total_with_urls * 100) if total_with_urls > 0 else 0, 1)
@@ -449,10 +475,11 @@ def get_batch_email_scraping_status():
     
     logger.debug(f"Email scraping status: {active_count} active, {len(truly_pending)} pending, {len(active_stores)} active stores retrieved")
     
-    return jsonify({
+    out = {
         'active_count': active_count,
         'pending_count': len(truly_pending),
         'max_concurrent': MAX_CONCURRENT_EMAIL_SCRAPING,
+        'available_slots': max(0, MAX_CONCURRENT_EMAIL_SCRAPING - active_count),
         'active_store_ids': active_store_ids,
         'active_stores': active_stores,
         'pending_stores': truly_pending[:20],
@@ -461,7 +488,10 @@ def get_batch_email_scraping_status():
         'progress_percent': progress_percent,
         'total_with_urls': total_with_urls,
         'pending_url_count': pending_url_count
-    })
+    }
+    if app_name:
+        out['app_name'] = app_name
+    return jsonify(out)
 
 @app.route('/api/stores/<int:store_id>')
 def get_store(store_id):
@@ -484,10 +514,14 @@ def continuous_worker():
             logger.error(f"Error in continuous worker: {e}", exc_info=True)
             time.sleep(10)  # Wait longer on error
 
-# Start background worker thread
-worker_thread = threading.Thread(target=continuous_worker, daemon=True)
-worker_thread.start()
-logger.info("Continuous email scraping worker thread started")
+# Continuous worker is DISABLED by default
+# Email scraping only starts when explicitly triggered via /api/email-scraping/batch/start
+# This allows URL finding to complete first before email scraping begins
+# Uncomment below to enable auto-start (not recommended for the current workflow)
+# worker_thread = threading.Thread(target=continuous_worker, daemon=True)
+# worker_thread.start()
+# logger.info("Continuous email scraping worker thread started")
+logger.info("Continuous email scraping worker DISABLED. Email scraping will only start when explicitly triggered via batch/start endpoint.")
 
 if __name__ == '__main__':
     logger.info(f"Starting Email Scraper Service on {HOST}:{PORT}")

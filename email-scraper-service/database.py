@@ -316,8 +316,8 @@ class Database:
         conn.close()
         return count
     
-    def get_stores_with_urls_no_emails(self, limit: int = None) -> List[Dict]:
-        """Get stores that have URLs but no emails yet (for batch email scraping)"""
+    def get_stores_with_urls_no_emails(self, limit: int = None, app_name: str = None) -> List[Dict]:
+        """Get stores that have URLs but no emails yet (for batch email scraping), optionally for a specific app"""
         conn = self.get_connection()
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
@@ -327,13 +327,20 @@ class Database:
             AND base_url != ''
             AND (status = 'url_verified' OR status = 'url_found')
             AND (emails IS NULL OR emails = '' OR emails = '[]')
-            ORDER BY id
         """
-        
+        params = []
+        if app_name:
+            query += " AND app_name = %s"
+            params.append(app_name)
+        query += " ORDER BY id"
         if limit:
-            query += f" LIMIT {limit}"
+            query += " LIMIT %s"
+            params.append(limit)
         
-        cursor.execute(query)
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
         rows = cursor.fetchall()
         conn.close()
         
