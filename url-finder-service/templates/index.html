@@ -14,7 +14,7 @@
                     <h1>Shopify Review Processor</h1>
                     <p>Unified workflow for scraping reviews, finding store URLs, and extracting emails</p>
                 </div>
-                <a href="/data" style="color: #3498db; text-decoration: none; font-weight: 500; padding: 10px 20px; border: 2px solid #3498db; border-radius: 4px;">View Data →</a>
+                <a id="view-data-link" href="/data" style="color: #3498db; text-decoration: none; font-weight: 500; padding: 10px 20px; border: 2px solid #3498db; border-radius: 4px;">View Data →</a>
             </div>
         </header>
 
@@ -58,9 +58,15 @@
             </div>
 
             <div class="section">
-                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;">
                     <h2 style="margin: 0;">Step 2: Find Store URLs</h2>
-                    <div style="display: flex; gap: 15px; align-items: center;">
+                    <div style="display: flex; gap: 15px; align-items: center; flex-wrap: wrap;">
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <label for="app-filter" style="font-size: 13px; color: #666;">Filter by app:</label>
+                            <select id="app-filter" style="padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; min-width: 180px; font-size: 13px;">
+                                <option value="">All apps</option>
+                            </select>
+                        </div>
                         <label class="auto-mode-toggle" id="auto-mode-toggle">
                             <input type="checkbox" id="auto-mode-checkbox">
                             <span class="toggle-slider"></span>
@@ -77,6 +83,16 @@
                 </div>
                 <div id="stores-container">
                     <p>No stores pending. Start scraping reviews first.</p>
+                </div>
+            </div>
+
+            <div class="section">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+                    <h2 style="margin: 0;">Step 3: Email Scraping</h2>
+                    <button id="start-email-scraping" class="btn-small" style="display: none; background: #3498db; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: 500;">📧 Start Email Scraping</button>
+                </div>
+                <div id="email-scraping-container" style="display: none;">
+                    <p style="color: #666; font-size: 14px; margin-bottom: 10px;">Email scraping will process stores with verified URLs. You can start it after URL finding completes or stop URL finding and start email scraping manually.</p>
                 </div>
             </div>
 

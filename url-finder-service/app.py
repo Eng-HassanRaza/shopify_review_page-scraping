@@ -118,13 +118,15 @@ def create_job():
                 
                 def progress_callback(message, current_page_val, total_pages, reviews_count):
                     final_page_tracked[0] = current_page_val
+                    total_so_far = existing_reviews_count + reviews_count
                     db.update_job_status(
                         job_id, 
                         'scraping_reviews',
                         progress_message=message,
                         current_page=current_page_val,
                         total_pages=total_pages,
-                        reviews_scraped=existing_reviews_count + reviews_count,
+                        reviews_scraped=total_so_far,
+                        total_stores=total_so_far,
                         max_reviews_limit=final_max_reviews_limit,
                         max_pages_limit=final_max_pages_limit
                     )
@@ -211,6 +213,7 @@ def create_job():
                     current_page=current_page,
                     total_pages=total_pages,
                     reviews_scraped=reviews_count,
+                    total_stores=reviews_count,
                     max_reviews_limit=max_reviews,
                     max_pages_limit=max_pages
                 )
@@ -304,17 +307,30 @@ def get_job(job_id):
 
 # ==================== Store Management Endpoints ====================
 
+def _app_name_from_request():
+    """Resolve job_id or app_name query param to app_name for scoping. Returns None for 'all apps'."""
+    job_id = request.args.get('job_id', type=int)
+    app_name = request.args.get('app_name', type=str)
+    if job_id:
+        job = db.get_job(job_id)
+        return job.get('app_name') if job else None
+    if app_name:
+        return app_name.strip() or None
+    return None
+
 @app.route('/api/stores/pending')
 def get_pending_stores():
-    """Get stores pending URL verification"""
+    """Get stores pending URL verification, optionally filtered by job_id or app_name"""
     limit = request.args.get('limit', type=int)
-    stores = db.get_pending_stores(limit=limit)
+    app_name = _app_name_from_request()
+    stores = db.get_pending_stores(limit=limit, app_name=app_name)
     return jsonify(stores)
 
 @app.route('/api/stores/next')
 def get_next_store():
-    """Get the next pending store (one at a time)"""
-    store = db.get_next_pending_store()
+    """Get the next pending store (one at a time), optionally for a specific app (job_id or app_name)"""
+    app_name = _app_name_from_request()
+    store = db.get_next_pending_store(app_name=app_name)
     if not store:
         return jsonify({'store': None, 'message': 'No more stores pending'})
     return jsonify({'store': store})
@@ -358,41 +374,54 @@ def update_store_url(store_id):
 
 @app.route('/api/stores/url-finding-status', methods=['GET'])
 def get_url_finding_status():
-    """Get status of URL finding phase"""
-    pending_count = db.count_pending_url_stores()
+    """Get status of URL finding phase, optionally filtered by job_id or app_name"""
+    app_name = _app_name_from_request()
+    
+    pending_count = db.count_pending_url_stores(app_name=app_name)
     
     conn = db.get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT COUNT(*) FROM stores")
+    if app_name:
+        cursor.execute("SELECT COUNT(*) FROM stores WHERE app_name = %s", (app_name,))
+    else:
+        cursor.execute("SELECT COUNT(*) FROM stores")
     total_stores = cursor.fetchone()[0]
     
-    cursor.execute("SELECT COUNT(*) FROM stores WHERE base_url IS NOT NULL AND base_url != ''")
+    if app_name:
+        cursor.execute("SELECT COUNT(*) FROM stores WHERE app_name = %s AND base_url IS NOT NULL AND base_url != ''", (app_name,))
+    else:
+        cursor.execute("SELECT COUNT(*) FROM stores WHERE base_url IS NOT NULL AND base_url != ''")
     stores_with_urls = cursor.fetchone()[0]
-    conn.close()
     
-    conn = db.get_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cursor.execute("SELECT * FROM stores WHERE status = 'pending_url' OR status = 'url_found' ORDER BY id LIMIT 10")
+    cursor_dict = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    if app_name:
+        cursor_dict.execute("SELECT * FROM stores WHERE app_name = %s AND (status = 'pending_url' OR status = 'url_found') ORDER BY id LIMIT 10", (app_name,))
+    else:
+        cursor_dict.execute("SELECT * FROM stores WHERE status = 'pending_url' OR status = 'url_found' ORDER BY id LIMIT 10")
     pending_stores = []
-    for row in cursor.fetchall():
+    for row in cursor_dict.fetchall():
         store = dict(row)
         if store.get('emails'):
             try:
                 store['emails'] = json.loads(store['emails'])
-            except:
+            except Exception:
                 store['emails'] = []
         else:
             store['emails'] = []
         pending_stores.append(store)
     
-    cursor.execute("SELECT * FROM stores WHERE base_url IS NOT NULL AND base_url != '' AND (status = 'url_verified' OR status = 'url_found') ORDER BY updated_at DESC LIMIT 5")
+    cursor2 = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    if app_name:
+        cursor2.execute("SELECT * FROM stores WHERE app_name = %s AND base_url IS NOT NULL AND base_url != '' AND (status = 'url_verified' OR status = 'url_found') ORDER BY updated_at DESC LIMIT 5", (app_name,))
+    else:
+        cursor2.execute("SELECT * FROM stores WHERE base_url IS NOT NULL AND base_url != '' AND (status = 'url_verified' OR status = 'url_found') ORDER BY updated_at DESC LIMIT 5")
     recently_found = []
-    for row in cursor.fetchall():
+    for row in cursor2.fetchall():
         store = dict(row)
         if store.get('emails'):
             try:
                 store['emails'] = json.loads(store['emails'])
-            except:
+            except Exception:
                 store['emails'] = []
         else:
             store['emails'] = []
@@ -409,7 +438,8 @@ def get_url_finding_status():
         'progress_percent': progress_percent,
         'pending_stores': pending_stores,
         'recently_found': recently_found,
-        'is_complete': pending_count == 0
+        'is_complete': pending_count == 0,
+        'app_name': app_name
     })
 
 @app.route('/api/stores/<int:store_id>/emails', methods=['PUT'])
@@ -458,8 +488,9 @@ def update_store_emails_manual(store_id):
 
 @app.route('/api/stores')
 def get_all_stores():
-    """Get all stores"""
-    stores = db.get_all_stores()
+    """Get all stores, optionally filtered by job_id or app_name"""
+    app_name = _app_name_from_request()
+    stores = db.get_all_stores(app_name=app_name)
     return jsonify(stores)
 
 @app.route('/api/stores/export', methods=['POST'])

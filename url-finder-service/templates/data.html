@@ -488,7 +488,10 @@
 
         async function loadData() {
             try {
-                const response = await fetch('/api/stores');
+                const params = new URLSearchParams(window.location.search);
+                const jobId = params.get('job_id');
+                const url = jobId ? '/api/stores?job_id=' + encodeURIComponent(jobId) : '/api/stores';
+                const response = await fetch(url);
                 allStores = await response.json();
                 filteredStores = [...allStores];
                 

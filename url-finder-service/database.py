@@ -229,21 +229,28 @@ class Database:
         conn.close()
         logger.info(f"Added {len(stores)} stores to database")
     
-    def get_pending_stores(self, limit: int = None) -> List[Dict]:
-        """Get stores that need URL finding"""
+    def get_pending_stores(self, limit: int = None, app_name: str = None) -> List[Dict]:
+        """Get stores that need URL finding, optionally filtered by app_name"""
         conn = self.get_connection()
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
         query = """
             SELECT * FROM stores
             WHERE status = 'pending_url' OR status = 'url_found'
-            ORDER BY id
         """
-        
+        params = []
+        if app_name:
+            query += " AND app_name = %s"
+            params.append(app_name)
+        query += " ORDER BY id"
         if limit:
-            query += f" LIMIT {limit}"
+            query += " LIMIT %s"
+            params.append(limit)
         
-        cursor.execute(query)
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
         rows = cursor.fetchall()
         conn.close()
         
@@ -268,17 +275,25 @@ class Database:
         
         return stores
     
-    def get_next_pending_store(self) -> Optional[Dict]:
-        """Get the next pending store (one at a time)"""
+    def get_next_pending_store(self, app_name: str = None) -> Optional[Dict]:
+        """Get the next pending store (one at a time), optionally for a specific app"""
         conn = self.get_connection()
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
-        cursor.execute("""
-            SELECT * FROM stores
-            WHERE status = 'pending_url'
-            ORDER BY id
-            LIMIT 1
-        """)
+        if app_name:
+            cursor.execute("""
+                SELECT * FROM stores
+                WHERE status = 'pending_url' AND app_name = %s
+                ORDER BY id
+                LIMIT 1
+            """, (app_name,))
+        else:
+            cursor.execute("""
+                SELECT * FROM stores
+                WHERE status = 'pending_url'
+                ORDER BY id
+                LIMIT 1
+            """)
         
         row = cursor.fetchone()
         conn.close()
@@ -302,15 +317,21 @@ class Database:
             return store
         return None
     
-    def count_pending_url_stores(self) -> int:
-        """Count stores that still need URLs"""
+    def count_pending_url_stores(self, app_name: str = None) -> int:
+        """Count stores that still need URLs, optionally for a specific app"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute("""
-            SELECT COUNT(*) FROM stores
-            WHERE status = 'pending_url'
-        """)
+        if app_name:
+            cursor.execute("""
+                SELECT COUNT(*) FROM stores
+                WHERE status = 'pending_url' AND app_name = %s
+            """, (app_name,))
+        else:
+            cursor.execute("""
+                SELECT COUNT(*) FROM stores
+                WHERE status = 'pending_url'
+            """)
         
         count = cursor.fetchone()[0]
         conn.close()

@@ -8,8 +8,35 @@ let autoMode = false; // Auto-mode state
 let aiAutoSelectMode = false; // AI auto-selection mode state
 let urlFindingActive = false; // Track if URL finding is actively running
 
-document.addEventListener('DOMContentLoaded', () => {
+// App-scoped view: filter URL finding and email scraping to one Shopify app
+let jobsList = [];
+let selectedJobId = localStorage.getItem('selectedJobId') ? parseInt(localStorage.getItem('selectedJobId'), 10) : null;
+let selectedAppName = null; // derived from jobsList when selection changes
+
+function getScopeQuery() {
+    if (selectedJobId != null && !isNaN(selectedJobId)) return '?job_id=' + selectedJobId;
+    return '';
+}
+function getScopeForEmailScraper() {
+    if (selectedAppName) return { app_name: selectedAppName };
+    return {};
+}
+function getScopeQueryForEmailScraper() {
+    if (selectedAppName) return '?app_name=' + encodeURIComponent(selectedAppName);
+    return '';
+}
+function updateSelectedAppName() {
+    if (selectedJobId == null || !jobsList.length) {
+        selectedAppName = null;
+        return;
+    }
+    const job = jobsList.find(j => j.id === selectedJobId);
+    selectedAppName = job ? job.app_name : null;
+}
+
+document.addEventListener('DOMContentLoaded', async () => {
     initializeEventListeners();
+    await loadJobsAndAppFilter();
     startPolling();
     initializePage();
     initializeAutoMode();
@@ -55,14 +82,15 @@ function initializeAutoMode() {
 }
 
 async function initializePage() {
-    // Check if email scraping is in progress
+    // Check if email scraping is in progress (with optional app scope)
     try {
-        const batchStatusResponse = await fetch(`${EMAIL_SCRAPER_SERVICE_URL}/api/email-scraping/batch/status`);
+        const batchStatusResponse = await fetch(`${EMAIL_SCRAPER_SERVICE_URL}/api/email-scraping/batch/status${getScopeQueryForEmailScraper()}`);
         if (batchStatusResponse.ok) {
             const batchStatus = await batchStatusResponse.json();
             if (batchStatus.is_processing || batchStatus.pending_count > 0) {
                 // Email scraping is active, show that phase
                 startBatchEmailScrapingMonitor();
+                updateEmailScrapingButton();
                 return;
             }
         }
@@ -70,15 +98,16 @@ async function initializePage() {
         console.error('Error checking batch status:', error);
     }
     
-    // Check URL finding status (but don't auto-start)
+    // Check URL finding status (but don't auto-start) (with optional app scope)
     try {
-        const urlStatusResponse = await fetch('/api/stores/url-finding-status');
+        const urlStatusResponse = await fetch('/api/stores/url-finding-status' + getScopeQuery());
         if (urlStatusResponse.ok) {
             const urlStatus = await urlStatusResponse.json();
             
             if (urlStatus.is_complete && urlStatus.stores_with_urls > 0) {
-                // All URLs found, start email scraping
-                await startBatchEmailScraping();
+                // All URLs found - show button to start email scraping (don't auto-start)
+                updateEmailScrapingButton();
+                await displayUrlFindingStatus(urlStatus);
                 return;
             } else if (urlStatus.pending_count > 0) {
                 // Show status but don't start automatically
@@ -102,13 +131,65 @@ async function initializePage() {
     
     // Just show status, don't auto-start
     updateUrlFindingButtons();
+    updateEmailScrapingButton();
     
     // Also check button state periodically
     setInterval(() => {
         if (!urlFindingActive && !urlFindingStatusInterval) {
             updateUrlFindingButtons();
+            updateEmailScrapingButton();
         }
     }, 5000);
+}
+
+async function loadJobsAndAppFilter() {
+    try {
+        const res = await fetch('/api/jobs');
+        if (!res.ok) return;
+        jobsList = await res.json();
+        const sel = document.getElementById('app-filter');
+        if (!sel) return;
+        const currentValue = sel.value;
+        sel.innerHTML = '<option value="">All apps</option>';
+        jobsList.forEach(job => {
+            const opt = document.createElement('option');
+            opt.value = job.id;
+            opt.textContent = job.app_name || job.app_url || 'Job ' + job.id;
+            sel.appendChild(opt);
+        });
+        if (selectedJobId != null && jobsList.some(j => j.id === selectedJobId)) {
+            sel.value = selectedJobId;
+        }
+        updateSelectedAppName();
+        sel.addEventListener('change', () => {
+            const v = sel.value;
+            selectedJobId = v ? parseInt(v, 10) : null;
+            localStorage.setItem('selectedJobId', selectedJobId != null ? String(selectedJobId) : '');
+            updateSelectedAppName();
+            refreshScopedData();
+            updateViewDataLink();
+        });
+        updateViewDataLink();
+    } catch (e) {
+        console.error('Error loading jobs for app filter:', e);
+    }
+}
+
+function refreshScopedData() {
+    updateUrlFindingButtons();
+    updateEmailScrapingButton();
+    if (urlFindingStatusInterval) {
+        clearInterval(urlFindingStatusInterval);
+        urlFindingStatusInterval = null;
+        startUrlFindingStatusMonitor();
+    }
+    fetchStatistics();
+}
+
+function updateViewDataLink() {
+    const link = document.getElementById('view-data-link');
+    if (!link) return;
+    link.href = selectedJobId != null ? '/data?job_id=' + selectedJobId : '/data';
 }
 
 function initializeEventListeners() {
@@ -125,6 +206,14 @@ function initializeEventListeners() {
     }
     if (stopUrlFindingBtn) {
         stopUrlFindingBtn.addEventListener('click', stopUrlFinding);
+    }
+    
+    // Email scraping button
+    const startEmailScrapingBtn = document.getElementById('start-email-scraping');
+    if (startEmailScrapingBtn) {
+        startEmailScrapingBtn.addEventListener('click', async () => {
+            await startBatchEmailScraping();
+        });
     }
     
     // Email service URL configuration
@@ -497,22 +586,20 @@ function startUrlFindingStatusMonitor() {
         }
         
         try {
-            const response = await fetch('/api/stores/url-finding-status');
+            const response = await fetch('/api/stores/url-finding-status' + getScopeQuery());
             if (response.ok) {
                 const statusData = await response.json();
                 await displayUrlFindingStatus(statusData);
                 updateUrlFindingButtons();
                 
-                // If all URLs are found, stop monitoring and start email scraping
+                // If all URLs are found, stop monitoring - user can manually start email scraping
                 if (statusData.is_complete && statusData.stores_with_urls > 0) {
                     urlFindingActive = false;
                     clearInterval(urlFindingStatusInterval);
                     urlFindingStatusInterval = null;
                     updateUrlFindingButtons();
-                    showStatus('All URLs found! Starting email scraping...', 'success');
-                    setTimeout(async () => {
-                        await startBatchEmailScraping();
-                    }, 1000);
+                    showStatus('All URLs found! You can now start email scraping.', 'success');
+                    updateEmailScrapingButton();
                 } else if (statusData.pending_count === 0 && statusData.stores_with_urls === 0) {
                     // No more stores to process
                     urlFindingActive = false;
@@ -530,14 +617,14 @@ function startUrlFindingStatusMonitor() {
 
 async function loadNextStore() {
     try {
-        const response = await fetch('/api/stores/next');
+        const response = await fetch('/api/stores/next' + getScopeQuery());
         const data = await response.json();
         
         const container = document.getElementById('stores-container');
         
         if (!data.store) {
             // Check if we're in URL finding phase
-            const urlStatusResponse = await fetch('/api/stores/url-finding-status');
+            const urlStatusResponse = await fetch('/api/stores/url-finding-status' + getScopeQuery());
             if (urlStatusResponse.ok) {
                 const urlStatus = await urlStatusResponse.json();
                 if (!urlStatus.is_complete) {
@@ -567,7 +654,7 @@ async function loadNextStore() {
         const escapedCountry = (currentStore.country || '').replace(/'/g, "\\'").replace(/"/g, '&quot;');
         
         // Show current store in context of URL finding status
-        const urlStatusResponse = await fetch('/api/stores/url-finding-status');
+        const urlStatusResponse = await fetch('/api/stores/url-finding-status' + getScopeQuery());
         if (urlStatusResponse.ok) {
             const urlStatus = await urlStatusResponse.json();
             await displayUrlFindingStatus(urlStatus);
@@ -920,7 +1007,7 @@ async function startUrlFinding() {
     
     // Check if email scraping is in progress first
     try {
-        const batchStatusResponse = await fetch(`${EMAIL_SCRAPER_SERVICE_URL}/api/email-scraping/batch/status`);
+        const batchStatusResponse = await fetch(`${EMAIL_SCRAPER_SERVICE_URL}/api/email-scraping/batch/status${getScopeQueryForEmailScraper()}`);
         if (batchStatusResponse.ok) {
             const batchStatus = await batchStatusResponse.json();
             if (batchStatus.is_processing || batchStatus.pending_count > 0) {
@@ -936,7 +1023,7 @@ async function startUrlFinding() {
     
     // Check URL finding status
     try {
-        const urlStatusResponse = await fetch('/api/stores/url-finding-status');
+        const urlStatusResponse = await fetch('/api/stores/url-finding-status' + getScopeQuery());
         if (urlStatusResponse.ok) {
             const urlStatus = await urlStatusResponse.json();
             
@@ -949,10 +1036,12 @@ async function startUrlFinding() {
                 showStatus('URL finding started!', 'success');
                 return;
             } else if (urlStatus.is_complete && urlStatus.stores_with_urls > 0) {
-                // All URLs found (no pending), now start email scraping
+                // All URLs found (no pending) - show button to start email scraping
                 urlFindingActive = false;
                 updateUrlFindingButtons();
-                await startBatchEmailScraping();
+                showStatus('All URLs found! You can now start email scraping.', 'success');
+                updateEmailScrapingButton();
+                await displayUrlFindingStatus(urlStatus);
                 return;
             } else {
                 // No pending URLs and no stores with URLs
@@ -993,10 +1082,12 @@ function stopUrlFinding() {
     closeModal();
     
     updateUrlFindingButtons();
+    updateEmailScrapingButton();
+    showStatus('URL finding stopped. You can start email scraping for stores with verified URLs.', 'info');
     showStatus('URL finding stopped.', 'info');
     
     // Show current status without auto-loading next store
-    fetch('/api/stores/url-finding-status')
+    fetch('/api/stores/url-finding-status' + getScopeQuery())
         .then(response => response.json())
         .then(statusData => displayUrlFindingStatus(statusData))
         .catch(error => console.error('Error fetching URL status:', error));
@@ -1009,7 +1100,7 @@ function updateUrlFindingButtons() {
     if (!startBtn || !stopBtn) return;
     
     // Check if there are pending stores
-    fetch('/api/stores/url-finding-status')
+    fetch('/api/stores/url-finding-status' + getScopeQuery())
         .then(response => response.json())
         .then(statusData => {
             const hasPending = statusData.pending_count > 0 && !statusData.is_complete;
@@ -1036,18 +1127,88 @@ function updateUrlFindingButtons() {
         });
 }
 
+async function updateEmailScrapingButton() {
+    const emailBtn = document.getElementById('start-email-scraping');
+    const emailContainer = document.getElementById('email-scraping-container');
+    
+    if (!emailBtn) return;
+    
+    try {
+        // Check if email scraping is already in progress
+        const batchStatusResponse = await fetch(`${EMAIL_SCRAPER_SERVICE_URL}/api/email-scraping/batch/status${getScopeQueryForEmailScraper()}`);
+        if (batchStatusResponse.ok) {
+            const batchStatus = await batchStatusResponse.json();
+            if (batchStatus.is_processing || batchStatus.pending_count > 0) {
+                // Email scraping is already running
+                emailBtn.style.display = 'none';
+                if (emailContainer) emailContainer.style.display = 'block';
+                return;
+            }
+        }
+        
+        // Check if there are stores with URLs but no emails
+        const urlStatusResponse = await fetch('/api/stores/url-finding-status' + getScopeQuery());
+        if (urlStatusResponse.ok) {
+            const urlStatus = await urlStatusResponse.json();
+            const hasStoresWithUrls = urlStatus.stores_with_urls > 0;
+            
+            // Show button if there are stores with URLs (ready for email scraping)
+            // and URL finding is not active (user can start email scraping)
+            if (hasStoresWithUrls && !urlFindingActive) {
+                emailBtn.style.display = 'block';
+                if (emailContainer) {
+                    emailContainer.style.display = 'block';
+                    const pendingCount = urlStatus.pending_count || 0;
+                    if (pendingCount > 0) {
+                        emailContainer.innerHTML = `
+                            <p style="color: #856404; font-size: 14px; margin-bottom: 10px; padding: 10px; background: #fff3cd; border-radius: 4px;">
+                                ⚠️ <strong>${pendingCount}</strong> stores still need URLs. You can start email scraping for <strong>${urlStatus.stores_with_urls}</strong> stores with verified URLs, or continue finding URLs first.
+                            </p>
+                        `;
+                    } else {
+                        emailContainer.innerHTML = `
+                            <p style="color: #27ae60; font-size: 14px; margin-bottom: 10px; padding: 10px; background: #d4edda; border-radius: 4px;">
+                                ✓ All URLs found! <strong>${urlStatus.stores_with_urls}</strong> stores ready for email scraping.
+                            </p>
+                        `;
+                    }
+                }
+            } else {
+                emailBtn.style.display = 'none';
+                if (emailContainer) {
+                    if (hasStoresWithUrls && urlFindingActive) {
+                        emailContainer.style.display = 'block';
+                        emailContainer.innerHTML = `
+                            <p style="color: #666; font-size: 14px; margin-bottom: 10px;">
+                                URL finding in progress. Stop URL finding to start email scraping for stores with verified URLs.
+                            </p>
+                        `;
+                    } else if (!hasStoresWithUrls) {
+                        emailContainer.style.display = 'none';
+                    }
+                }
+            }
+        }
+    } catch (error) {
+        console.error('Error checking email scraping button status:', error);
+        emailBtn.style.display = 'none';
+    }
+}
+
 async function startBatchEmailScraping() {
     try {
         showStatus('Starting batch email scraping...', 'info');
         const response = await fetch(`${EMAIL_SCRAPER_SERVICE_URL}/api/email-scraping/batch/start`, {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'}
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(getScopeForEmailScraper())
         });
         
         if (response.ok) {
             const data = await response.json();
             showStatus(`Batch email scraping started. ${data.active_count} stores processing concurrently.`, 'success');
             startBatchEmailScrapingMonitor();
+            updateEmailScrapingButton(); // Hide button since scraping started
         } else {
             const error = await response.json();
             showStatus(`Error: ${error.message || 'Failed to start batch email scraping'}`, 'error');
@@ -1064,7 +1225,7 @@ function startBatchEmailScrapingMonitor() {
     
     batchEmailScrapingInterval = setInterval(async () => {
         try {
-            const response = await fetch(`${EMAIL_SCRAPER_SERVICE_URL}/api/email-scraping/batch/status`);
+            const response = await fetch(`${EMAIL_SCRAPER_SERVICE_URL}/api/email-scraping/batch/status${getScopeQueryForEmailScraper()}`);
             if (response.ok) {
                 const data = await response.json();
                 await displayBatchEmailScrapingStatus(data);
@@ -1074,12 +1235,12 @@ function startBatchEmailScrapingMonitor() {
                     // Start jobs to fill available slots - do them in parallel, not sequentially
                     const jobsToStart = Math.min(data.available_slots, data.pending_count);
                     const startPromises = [];
-                    
                     for (let i = 0; i < jobsToStart; i++) {
                         startPromises.push(
                             fetch(`${EMAIL_SCRAPER_SERVICE_URL}/api/email-scraping/start-next-job`, {
                                 method: 'POST',
-                                headers: {'Content-Type': 'application/json'}
+                                headers: {'Content-Type': 'application/json'},
+                                body: JSON.stringify(getScopeForEmailScraper())
                             }).then(async (startResponse) => {
                                 if (startResponse.ok) {
                                     const startData = await startResponse.json();
@@ -1116,9 +1277,10 @@ function startBatchEmailScrapingMonitor() {
                     batchEmailScrapingInterval = null;
                     showStatus('All email scraping completed!', 'success');
                     updateStatistics();
+                    updateEmailScrapingButton(); // Update button state
                     
                     // Check for more stores that need URL finding
-                    const nextStoreResponse = await fetch('/api/stores/next');
+                    const nextStoreResponse = await fetch('/api/stores/next' + getScopeQuery());
                     if (nextStoreResponse.ok) {
                         const nextStoreData = await nextStoreResponse.json();
                         if (nextStoreData.store) {
@@ -1713,13 +1875,11 @@ async function selectExtractedUrl(storeId, url) {
             
             // Check if all URLs are found (pending_url_count === 0)
             if (data.pending_url_count === 0) {
-                // All URLs found! Stop URL finding and start batch email scraping
+                // All URLs found! Stop URL finding - user can manually start email scraping
                 urlFindingActive = false;
                 updateUrlFindingButtons();
-                showStatus('All URLs found! Starting batch email scraping...', 'success');
-                setTimeout(async () => {
-                    await startBatchEmailScraping();
-                }, 1000);
+                showStatus('All URLs found! You can now start email scraping.', 'success');
+                updateEmailScrapingButton();
             } else {
                 // Not all URLs found yet - if URL finding is active and auto-mode is on, move to next store
                 if (urlFindingActive && autoMode) {
@@ -1810,7 +1970,8 @@ async function scrapeEmails(storeId, url) {
 
 async function updateStatistics() {
     try {
-        const url = currentJobId ? `/api/statistics?job_id=${currentJobId}` : '/api/statistics';
+        const jobId = selectedJobId != null ? selectedJobId : currentJobId;
+        const url = jobId != null ? `/api/statistics?job_id=${jobId}` : '/api/statistics';
         const response = await fetch(url);
         const stats = await response.json();
         
@@ -1827,7 +1988,7 @@ async function updateStatistics() {
 
 async function exportJSON() {
     try {
-        const response = await fetch('/api/stores');
+        const response = await fetch('/api/stores' + getScopeQuery());
         const stores = await response.json();
         
         const blob = new Blob([JSON.stringify(stores, null, 2)], {type: 'application/json'});
@@ -1844,7 +2005,7 @@ async function exportJSON() {
 
 async function exportCSV() {
     try {
-        const response = await fetch('/api/stores');
+        const response = await fetch('/api/stores' + getScopeQuery());
         const stores = await response.json();
         
         const headers = ['ID', 'Store Name', 'Country', 'Base URL', 'Emails', 'Status'];
