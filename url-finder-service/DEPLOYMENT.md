@@ -105,8 +105,6 @@ DATABASE_URL=postgresql://your_db_user:your_db_password@your-rds-endpoint.region
 # API Keys
 GEMINI_API_KEY=your_gemini_key
 PERPLEXITY_API_KEY=your_perplexity_key
-GOOGLE_CSE_API_KEY=your_cse_key
-GOOGLE_CSE_CX=your_cse_cx
 OPENAI_API_KEY=your_openai_key
 
 # Worker Configuration
@@ -114,7 +112,7 @@ WORKER_ENABLED=true
 WORKER_SLEEP_SECONDS=5
 WORKER_BATCH_SIZE=10
 WORKER_MAX_RETRIES=3
-PROVIDER_PRIORITY=gemini,perplexity,cse
+PROVIDER_PRIORITY=gemini,perplexity
 AUTO_SAVE_THRESHOLD=0.7
 LOW_CONFIDENCE_THRESHOLD=0.5
 

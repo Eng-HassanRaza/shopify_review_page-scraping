@@ -41,63 +41,85 @@ async function loadUrlFinderConfig() {
         if (!res.ok) return;
         const cfg = await res.json();
         if (!urlFinderProvider) {
-            urlFinderProvider = cfg.default_provider || 'cse';
+            if (cfg.gemini_configured) {
+                urlFinderProvider = 'gemini';
+            } else if (cfg.perplexity_configured) {
+                urlFinderProvider = 'perplexity';
+            } else {
+                urlFinderProvider = cfg.default_provider || 'gemini';
+            }
             localStorage.setItem('urlFinderProvider', urlFinderProvider);
         }
         updateUrlFinderProviderSelector(cfg);
+        await syncWorkerProvider(urlFinderProvider);
     } catch (e) {
         console.error('Error loading URL finder config:', e);
         if (!urlFinderProvider) {
-            urlFinderProvider = 'cse';
+            urlFinderProvider = 'gemini';
             localStorage.setItem('urlFinderProvider', urlFinderProvider);
         }
         updateUrlFinderProviderSelector();
+        await syncWorkerProvider(urlFinderProvider);
     }
 }
 
 function updateUrlFinderProviderSelector(cfg) {
     const providerSelect = document.getElementById('url-finder-provider');
     if (!providerSelect) return;
-    const isCseConfigured = cfg ? cfg.cse_configured !== false : undefined;
     const isPerplexityConfigured = cfg ? cfg.perplexity_configured !== false : undefined;
     const isGeminiConfigured = cfg ? cfg.gemini_configured !== false : undefined;
 
     // Disable unavailable options (visual hint)
-    const cseOpt = providerSelect.querySelector('option[value="cse"]');
     const pplxOpt = providerSelect.querySelector('option[value="perplexity"]');
     const geminiOpt = providerSelect.querySelector('option[value="gemini"]');
-    if (cseOpt) cseOpt.disabled = isCseConfigured === false;
     if (pplxOpt) pplxOpt.disabled = isPerplexityConfigured === false;
     if (geminiOpt) geminiOpt.disabled = isGeminiConfigured === false;
 
-    // If current provider isn't available, fall back
+    // If current provider isn't available, only fall back to another API provider.
+    // Never auto-switch to Chrome Extension (manual-only).
     if (urlFinderProvider === 'perplexity' && isPerplexityConfigured === false) {
-        urlFinderProvider = isCseConfigured === false ? 'extension' : 'cse';
-        localStorage.setItem('urlFinderProvider', urlFinderProvider);
+        if (isGeminiConfigured) {
+            urlFinderProvider = 'gemini';
+            localStorage.setItem('urlFinderProvider', urlFinderProvider);
+        }
     }
     if (urlFinderProvider === 'gemini' && isGeminiConfigured === false) {
-        // Prefer cse if available, else perplexity, else extension
-        urlFinderProvider = isCseConfigured === false ? (isPerplexityConfigured === false ? 'extension' : 'perplexity') : 'cse';
+        if (isPerplexityConfigured) {
+            urlFinderProvider = 'perplexity';
+            localStorage.setItem('urlFinderProvider', urlFinderProvider);
+        }
+    }
+    if (!['gemini', 'perplexity', 'extension'].includes(urlFinderProvider)) {
+        urlFinderProvider = 'gemini';
         localStorage.setItem('urlFinderProvider', urlFinderProvider);
     }
-    if (urlFinderProvider === 'cse' && isCseConfigured === false) {
-        urlFinderProvider = isPerplexityConfigured === false
-            ? (isGeminiConfigured === false ? 'extension' : 'gemini')
-            : 'perplexity';
-        localStorage.setItem('urlFinderProvider', urlFinderProvider);
-    }
-    providerSelect.value = urlFinderProvider || 'cse';
+    providerSelect.value = urlFinderProvider || 'gemini';
 }
 
 function getProviderLabel(provider) {
-    if (provider === 'cse') return 'Google CSE';
     if (provider === 'perplexity') return 'Perplexity';
     if (provider === 'gemini') return 'Gemini';
     return 'Chrome Extension';
 }
 
+async function syncWorkerProvider(provider) {
+    if (!provider) return;
+    try {
+        await fetch('/api/worker/provider', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ provider })
+        });
+    } catch (e) {
+        console.error('Error syncing worker provider:', e);
+    }
+}
+
+let workerStatusInterval = null;
+
 document.addEventListener('DOMContentLoaded', async () => {
     initializeEventListeners();
+    initializeWorkerStatus();
     await loadUrlFinderConfig();
     await loadJobsAndAppFilter();
     startPolling();
@@ -272,10 +294,13 @@ function initializeEventListeners() {
         stopUrlFindingBtn.addEventListener('click', stopUrlFinding);
     }
     if (providerSelect) {
-        providerSelect.addEventListener('change', () => {
+        // Update worker provider when provider selector changes
+        providerSelect.addEventListener('change', async () => {
             urlFinderProvider = providerSelect.value;
             localStorage.setItem('urlFinderProvider', urlFinderProvider);
             showStatus(`URL source set to ${getProviderLabel(urlFinderProvider)}.`, 'info');
+            await syncWorkerProvider(urlFinderProvider);
+            showStatus(`Worker provider updated to ${getProviderLabel(urlFinderProvider)}`, 'success');
         });
     }
     
@@ -1433,15 +1458,40 @@ async function displayBatchEmailScrapingStatus(statusData) {
                 `;
             }
         } else if (statusData.active_store_ids && statusData.active_store_ids.length > 0) {
-            // Fallback: if active_stores array is empty but we have active_store_ids, show them
-            for (const storeId of statusData.active_store_ids) {
+            // Fallback: if active_stores array is empty but we have active_store_ids, fetch store names in parallel
+            const storePromises = statusData.active_store_ids.map(async (storeId) => {
+                try {
+                    const storeResponse = await fetch(`/api/stores/${storeId}`);
+                    if (storeResponse.ok) {
+                        const storeData = await storeResponse.json();
+                        return {
+                            id: storeId,
+                            name: storeData.store_name || `Store ${storeId}`,
+                            country: storeData.country || 'N/A',
+                            url: storeData.base_url || null
+                        };
+                    }
+                } catch (e) {
+                    console.error(`Error fetching store ${storeId}:`, e);
+                }
+                return {
+                    id: storeId,
+                    name: `Store ${storeId}`,
+                    country: 'N/A',
+                    url: null
+                };
+            });
+            
+            const stores = await Promise.all(storePromises);
+            for (const store of stores) {
                 html += `
                     <div class="store-item" style="border: 2px solid #f39c12; border-radius: 8px; padding: 15px; background: #fff; box-shadow: 0 2px 4px rgba(243,156,18,0.2);">
                         <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 10px;">
-                            <h4 style="margin: 0; flex: 1; font-size: 15px;">Store ID: ${storeId}</h4>
+                            <h4 style="margin: 0; flex: 1; font-size: 15px;">${store.name}</h4>
                             <span style="background: #f39c12; color: white; padding: 4px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; animation: pulse 2s infinite;">📧 Scraping...</span>
                         </div>
-                        <p style="margin: 5px 0; font-size: 13px; color: #666;">Loading store details...</p>
+                        <p style="margin: 5px 0; font-size: 13px; color: #666;"><strong>Country:</strong> ${store.country}</p>
+                        ${store.url ? `<p style="margin: 5px 0; font-size: 12px; color: #0066cc; word-break: break-all;"><strong>URL:</strong> ${store.url}</p>` : ''}
                     </div>
                 `;
             }
@@ -1646,10 +1696,13 @@ async function findStoreUrl(storeId, storeName, country) {
         }
     }
 
-    // Provider: Gemini (Google Search tool) (ranked URLs + confidence; autosave if high confidence)
+    // Provider: Gemini (Google Search tool) - Auto-process with validation, no popups
     if (urlFinderProvider === 'gemini') {
         try {
-            modalBody.innerHTML = '<div class="loading">Searching via Gemini...</div>';
+            // Don't show popup - work silently in background
+            if (!autoMode) {
+                modalBody.innerHTML = '<div class="loading">Searching via Gemini...</div>';
+            }
 
             // Gather additional context (optional)
             let reviewText = '';
@@ -1667,10 +1720,12 @@ async function findStoreUrl(storeId, storeName, country) {
                 }
             }
 
+            // Call Gemini with store_id to auto-process and save
             const response = await fetch('/api/search/gemini', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({
+                    store_id: storeId,  // Include store_id for auto-processing
                     store_name: cleanName,
                     country: country || '',
                     review_text: reviewText || ''
@@ -1680,24 +1735,62 @@ async function findStoreUrl(storeId, storeName, country) {
             const data = await response.json();
             if (!response.ok) {
                 const errorMessage = data.error || 'Gemini request failed.';
-                const suggestion = data.suggestion || 'You can switch providers or enter the URL manually.';
-                const isRateLimit = response.status === 429 || data.error_type === 'rate_limit' || data.error_type === 'rate_limit_exhausted';
+                console.error(`Gemini search failed for store ${storeId}: ${errorMessage}`);
                 
-                modalBody.innerHTML = `
-                    <div class="manual-url-entry">
-                        <p><strong>Gemini search failed.</strong> ${errorMessage}</p>
-                        ${isRateLimit ? '<p style="margin-top: 10px; color: #856404; background: #fff3cd; padding: 10px; border-radius: 4px; border-left: 4px solid #ffc107;"><strong>Rate limit exceeded:</strong> Gemini API is temporarily unavailable. The system will retry automatically, but you may want to switch to another provider (Google CSE, Perplexity, or Chrome Extension) for now.</p>' : ''}
-                        <p style="margin-top: 10px;">${suggestion}</p>
-                        <div class="input-group" style="margin-top: 10px;">
-                            <input type="text" id="manual-url-input" placeholder="Paste store URL here" style="width: 100%; padding: 10px;">
+                // Only show popup if not in auto mode
+                if (!autoMode) {
+                    const suggestion = data.suggestion || 'You can switch providers or enter the URL manually.';
+                    const isRateLimit = response.status === 429 || data.error_type === 'rate_limit' || data.error_type === 'rate_limit_exhausted';
+                    
+                    modalBody.innerHTML = `
+                        <div class="manual-url-entry">
+                            <p><strong>Gemini search failed.</strong> ${errorMessage}</p>
+                            ${isRateLimit ? '<p style="margin-top: 10px; color: #856404; background: #fff3cd; padding: 10px; border-radius: 4px; border-left: 4px solid #ffc107;"><strong>Rate limit exceeded:</strong> Gemini API is temporarily unavailable. The system will retry automatically, but you may want to switch to another provider (Perplexity or Chrome Extension) for now.</p>' : ''}
+                            <p style="margin-top: 10px;">${suggestion}</p>
+                            <div class="input-group" style="margin-top: 10px;">
+                                <input type="text" id="manual-url-input" placeholder="Paste store URL here" style="width: 100%; padding: 10px;">
+                            </div>
+                            <button class="btn-small" onclick="confirmManualUrl(${storeId})" style="margin-top: 10px; width: 100%;">Confirm URL</button>
                         </div>
-                        <button class="btn-small" onclick="confirmManualUrl(${storeId})" style="margin-top: 10px; width: 100%;">Confirm URL</button>
-                    </div>
-                `;
+                    `;
+                } else {
+                    closeModal();
+                }
                 isFindingUrl = false;
                 return;
             }
 
+            // Check if auto-processing was successful
+            if (data.success !== undefined) {
+                // Auto-processing was done
+                const action = data.action || 'unknown';
+                const savedUrl = data.url;
+                const confidence = data.confidence;
+                
+                if (action === 'saved') {
+                    showStatus(`✓ URL found and saved for ${storeName}: ${savedUrl} (${Math.round((confidence || 0) * 100)}% confidence)`, 'success');
+                    closeModal();
+                    isFindingUrl = false;
+                    await loadStores(); // Refresh store list
+                    return;
+                } else if (action === 'needs_review') {
+                    showStatus(`⚠ ${storeName} marked for review (confidence: ${Math.round((confidence || 0) * 100)}%)`, 'warning');
+                    closeModal();
+                    isFindingUrl = false;
+                    await loadStores(); // Refresh store list
+                    return;
+                } else {
+                    // not_found or error
+                    const errorMsg = data.error || 'URL not found';
+                    showStatus(`✗ ${storeName}: ${errorMsg}`, 'error');
+                    closeModal();
+                    isFindingUrl = false;
+                    await loadStores(); // Refresh store list
+                    return;
+                }
+            }
+
+            // Fallback: Legacy mode (no store_id provided) - show manual selection
             const selectedUrl = data.selected_url;
             const confidence = typeof data.confidence === 'number' ? data.confidence : null;
             const threshold = typeof data.autosave_threshold === 'number' ? data.autosave_threshold : 0.7;
@@ -1711,62 +1804,29 @@ async function findStoreUrl(storeId, storeName, country) {
                 return;
             }
 
-            // Low/unknown confidence: show ranked modal for manual selection (no AI selector)
-            await displayRankedUrlsWithoutAI({
-                urls: data.results || [],
-                recommendedIndex: 0,
-                recommendedUrl: selectedUrl || null,
-                confidence: confidence,
-                reasoning: data.reasoning || '',
-                providerLabel: 'Gemini',
-                threshold: threshold
-            }, storeId, storeName);
+            // Low/unknown confidence: show ranked modal for manual selection (only if not auto mode)
+            if (!autoMode) {
+                await displayRankedUrlsWithoutAI({
+                    urls: data.results || [],
+                    recommendedIndex: 0,
+                    recommendedUrl: selectedUrl || null,
+                    confidence: confidence,
+                    reasoning: data.reasoning || '',
+                    providerLabel: 'Gemini',
+                    threshold: threshold
+                }, storeId, storeName);
+            } else {
+                closeModal();
+            }
             isFindingUrl = false;
             return;
         } catch (error) {
             console.error('Gemini search error:', error);
-            modalBody.innerHTML = `<p class="error">Gemini search error: ${error.message}</p>`;
-            isFindingUrl = false;
-            return;
-        }
-    }
-
-    // Primary path: Google CSE
-    if (urlFinderProvider === 'cse') {
-        try {
-            modalBody.innerHTML = '<div class="loading">Searching via Google CSE...</div>';
-            const response = await fetch('/api/search/cse', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    store_name: cleanName,
-                    country: country || ''
-                })
-            });
-
-            const data = await response.json();
-            if (response.ok && data.results && data.results.length > 0) {
-                await displayExtractedUrls(data.results, storeId, storeName);
-                isFindingUrl = false;
-                return;
+            if (!autoMode) {
+                modalBody.innerHTML = `<p class="error">Gemini search error: ${error.message}</p>`;
+            } else {
+                closeModal();
             }
-
-            const errorMessage = data.error || 'No results returned from CSE.';
-            modalBody.innerHTML = `
-                <div class="manual-url-entry">
-                    <p><strong>CSE search failed.</strong> ${errorMessage}</p>
-                    <p style="margin-top: 10px;">You can switch to Chrome Extension or enter the URL manually:</p>
-                    <div class="input-group" style="margin-top: 10px;">
-                        <input type="text" id="manual-url-input" placeholder="Paste store URL here" style="width: 100%; padding: 10px;">
-                    </div>
-                    <button class="btn-small" onclick="confirmManualUrl(${storeId})" style="margin-top: 10px; width: 100%;">Confirm URL</button>
-                </div>
-            `;
-            isFindingUrl = false;
-            return;
-        } catch (error) {
-            console.error('CSE search error:', error);
-            modalBody.innerHTML = `<p class="error">CSE search error: ${error.message}</p>`;
             isFindingUrl = false;
             return;
         }
@@ -2412,6 +2472,182 @@ function showStatus(message, type) {
         statusDiv.textContent = '';
         statusDiv.className = 'status';
     }, 5000);
+}
+
+async function initializeWorkerStatus() {
+    // Set up worker status polling
+    await updateWorkerStatus();
+    workerStatusInterval = setInterval(updateWorkerStatus, 5000); // Poll every 5 seconds
+    
+    // Set up start/stop button
+    const workerBtn = document.getElementById('worker-start-stop-btn');
+    if (workerBtn) {
+        workerBtn.addEventListener('click', async () => {
+            const isRunning = workerBtn.textContent.includes('Stop');
+            if (isRunning) {
+                await stopWorker();
+            } else {
+                await startWorker();
+            }
+        });
+    }
+}
+
+async function updateWorkerStatus() {
+    try {
+        const response = await fetch('/api/worker/status');
+        if (!response.ok) {
+            document.getElementById('worker-status-text').textContent = 'Not available';
+            return;
+        }
+        
+        const data = await response.json();
+        if (!data.enabled) {
+            document.getElementById('worker-status-text').textContent = 'Not enabled';
+            document.getElementById('worker-provider').textContent = '-';
+            document.getElementById('worker-current-store').textContent = '-';
+            document.getElementById('worker-pending').textContent = '0';
+            document.getElementById('worker-saved').textContent = '0';
+            document.getElementById('worker-review').textContent = '0';
+            document.getElementById('worker-errors').textContent = '0';
+            document.getElementById('worker-recent-stores').style.display = 'none';
+            const btn = document.getElementById('worker-start-stop-btn');
+            if (btn) {
+                btn.textContent = 'Start Worker';
+                btn.style.background = '#27ae60';
+            }
+            return;
+        }
+        
+        const status = data.status || {};
+        const isRunning = status.running || false;
+        const providerLabel = getProviderLabel(status.selected_provider || urlFinderProvider || 'gemini');
+        document.getElementById('worker-provider').textContent = providerLabel;
+        
+        // Update status text with visual indicator
+        const statusText = isRunning ? '🟢 Running' : '⏸️ Stopped';
+        document.getElementById('worker-status-text').textContent = statusText;
+        
+        // Update pending count
+        document.getElementById('worker-pending').textContent = status.pending_count || 0;
+        
+        // Display current store name and ID
+        const currentStore = status.current_store;
+        if (currentStore && currentStore.name) {
+            document.getElementById('worker-current-store').textContent = `${currentStore.name} (ID: ${currentStore.id})`;
+            document.getElementById('worker-current-processing').style.borderLeftColor = '#3498db';
+        } else {
+            document.getElementById('worker-current-store').textContent = isRunning ? 'Waiting for next store...' : 'No store being processed';
+            document.getElementById('worker-current-processing').style.borderLeftColor = '#95a5a6';
+        }
+        
+        // Update statistics
+        document.getElementById('worker-saved').textContent = status.saved_count || 0;
+        document.getElementById('worker-review').textContent = status.needs_review_count || 0;
+        document.getElementById('worker-errors').textContent = status.error_count || 0;
+        
+        // Display recently processed stores
+        const recentStores = status.recent_stores || [];
+        const recentStoresDiv = document.getElementById('worker-recent-stores');
+        const recentStoresList = document.getElementById('worker-recent-stores-list');
+        
+        if (recentStores.length > 0) {
+            recentStoresDiv.style.display = 'block';
+            let html = '<div style="display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 10px;">';
+            
+            for (const store of recentStores) {
+                let statusBadge = '';
+                let borderColor = '#95a5a6';
+                let bgColor = '#f8f9fa';
+                
+                if (store.status === 'url_verified' || store.status === 'url_found') {
+                    statusBadge = '✅ Saved';
+                    borderColor = '#27ae60';
+                    bgColor = '#f0f9f4';
+                } else if (store.status === 'needs_review') {
+                    statusBadge = '⚠️ Review';
+                    borderColor = '#f39c12';
+                    bgColor = '#fffbf0';
+                } else if (store.status === 'not_found') {
+                    statusBadge = '❌ Not Found';
+                    borderColor = '#e74c3c';
+                    bgColor = '#ffe6e6';
+                } else {
+                    statusBadge = '⏳ Processing';
+                }
+                
+                const confidence = store.confidence ? `${Math.round(store.confidence * 100)}%` : 'N/A';
+                const provider = store.provider || 'unknown';
+                
+                html += `
+                    <div style="padding: 10px; background: ${bgColor}; border-radius: 4px; border-left: 3px solid ${borderColor}; font-size: 12px;">
+                        <div style="display: flex; justify-content: space-between; align-items: start; margin-bottom: 5px;">
+                            <div style="font-weight: 600; flex: 1;">${store.store_name || `Store ${store.id}`}</div>
+                            <span style="background: ${borderColor}; color: white; padding: 2px 6px; border-radius: 3px; font-size: 10px; font-weight: bold;">${statusBadge}</span>
+                        </div>
+                        ${store.url ? `<div style="color: #0066cc; word-break: break-all; margin-top: 5px; font-size: 11px;"><strong>URL:</strong> ${store.url}</div>` : '<div style="color: #999; margin-top: 5px; font-size: 11px;">No URL found</div>'}
+                        <div style="color: #666; margin-top: 5px; font-size: 10px;">
+                            Confidence: ${confidence} | Provider: ${provider}
+                        </div>
+                    </div>
+                `;
+            }
+            
+            html += '</div>';
+            recentStoresList.innerHTML = html;
+        } else {
+            recentStoresDiv.style.display = 'none';
+        }
+        
+        // Update button
+        const btn = document.getElementById('worker-start-stop-btn');
+        if (btn) {
+            if (isRunning) {
+                btn.textContent = '⏸ Stop Worker';
+                btn.style.background = '#e74c3c';
+            } else {
+                btn.textContent = '▶ Start Worker';
+                btn.style.background = '#27ae60';
+            }
+        }
+    } catch (error) {
+        console.error('Error updating worker status:', error);
+        document.getElementById('worker-status-text').textContent = 'Error';
+    }
+}
+
+async function startWorker() {
+    try {
+        const response = await fetch('/api/worker/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ provider: urlFinderProvider || 'gemini' })
+        });
+        const data = await response.json();
+        if (response.ok) {
+            showStatus('Worker started successfully', 'success');
+            await updateWorkerStatus();
+        } else {
+            showStatus(`Failed to start worker: ${data.error || 'Unknown error'}`, 'error');
+        }
+    } catch (error) {
+        showStatus(`Error starting worker: ${error.message}`, 'error');
+    }
+}
+
+async function stopWorker() {
+    try {
+        const response = await fetch('/api/worker/stop', { method: 'POST' });
+        const data = await response.json();
+        if (response.ok) {
+            showStatus('Worker stopped successfully', 'success');
+            await updateWorkerStatus();
+        } else {
+            showStatus(`Failed to stop worker: ${data.error || 'Unknown error'}`, 'error');
+        }
+    } catch (error) {
+        showStatus(`Error stopping worker: ${error.message}`, 'error');
+    }
 }
 
 function closeModal() {

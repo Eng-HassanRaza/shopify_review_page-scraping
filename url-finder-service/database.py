@@ -122,6 +122,20 @@ class Database:
             conn.commit()
             logger.info("URL finding columns added")
         
+        # Add cooldown column if it doesn't exist
+        if not column_exists('stores', 'url_finding_cooldown_until'):
+            logger.info("Adding URL finding cooldown column to stores table...")
+            cursor.execute("ALTER TABLE stores ADD COLUMN url_finding_cooldown_until TIMESTAMP")
+            conn.commit()
+            logger.info("URL finding cooldown column added")
+        
+        # Add candidate URLs column for review stores
+        if not column_exists('stores', 'url_finding_candidates'):
+            logger.info("Adding URL finding candidates column to stores table...")
+            cursor.execute("ALTER TABLE stores ADD COLUMN url_finding_candidates TEXT")
+            conn.commit()
+            logger.info("URL finding candidates column added")
+        
         conn.close()
         logger.info("Database initialized")
     
@@ -254,13 +268,15 @@ class Database:
         logger.info(f"Added {len(stores)} stores to database")
     
     def get_pending_stores(self, limit: int = None, app_name: str = None) -> List[Dict]:
-        """Get stores that need URL finding, optionally filtered by app_name"""
+        """Get stores that need URL finding, optionally filtered by app_name.
+        Excludes stores in cooldown period."""
         conn = self.get_connection()
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
         query = """
             SELECT * FROM stores
-            WHERE status = 'pending_url' OR status = 'url_found'
+            WHERE (status = 'pending_url' OR status = 'url_found')
+            AND (url_finding_cooldown_until IS NULL OR url_finding_cooldown_until < NOW())
         """
         params = []
         if app_name:
@@ -726,7 +742,8 @@ class Database:
         
         updates = [
             "status = 'not_found'",
-            "updated_at = CURRENT_TIMESTAMP"
+            "updated_at = CURRENT_TIMESTAMP",
+            "url_finding_cooldown_until = CURRENT_TIMESTAMP + INTERVAL '24 hours'"  # Cooldown for 24 hours
         ]
         params = []
         
@@ -745,6 +762,76 @@ class Database:
             SET {', '.join(updates)}
             WHERE id = %s
         """, params)
+        
+        conn.commit()
+        conn.close()
+    
+    def get_stores_needing_review(self, limit: int = None, app_name: str = None) -> List[Dict]:
+        """Get stores that need manual review"""
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        query = """
+            SELECT * FROM stores
+            WHERE status = 'needs_review'
+        """
+        params = []
+        
+        if app_name:
+            query += " AND app_name = %s"
+            params.append(app_name)
+        
+        query += " ORDER BY updated_at DESC"
+        
+        if limit:
+            query += " LIMIT %s"
+            params.append(limit)
+        
+        cursor.execute(query, params)
+        stores = []
+        for row in cursor.fetchall():
+            store = dict(row)
+            if store.get('emails'):
+                try:
+                    store['emails'] = json.loads(store['emails'])
+                except:
+                    store['emails'] = []
+            else:
+                store['emails'] = []
+            stores.append(store)
+        
+        conn.close()
+        return stores
+    
+    def get_store_candidate_urls(self, store_id: int) -> List[str]:
+        """Get candidate URLs for a store (from url_finding_candidates if stored)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT url_finding_candidates FROM stores WHERE id = %s
+        """, (store_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row and row[0]:
+            try:
+                return json.loads(row[0])
+            except:
+                return []
+        return []
+
+    def save_store_candidate_urls(self, store_id: int, candidate_urls: List[str]):
+        """Save candidate URLs for a store"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        candidates_json = json.dumps(candidate_urls) if candidate_urls else None
+        cursor.execute("""
+            UPDATE stores
+            SET url_finding_candidates = %s
+            WHERE id = %s
+        """, (candidates_json, store_id))
         
         conn.commit()
         conn.close()

@@ -49,13 +49,8 @@ BROWSER_TIMEOUT = 30000  # Page load timeout (ms)
 # User agent for browser
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
-# Google Custom Search (CSE) settings
-GOOGLE_CSE_API_KEY = os.getenv('GOOGLE_CSE_API_KEY', '')
-GOOGLE_CSE_CX = os.getenv('GOOGLE_CSE_CX', '')
-GOOGLE_CSE_TIMEOUT = int(os.getenv('GOOGLE_CSE_TIMEOUT', '15'))
-
-# URL finder provider: "cse" (default) or "extension"
-URL_FINDER_PROVIDER = os.getenv('URL_FINDER_PROVIDER', 'cse').lower()
+# URL finder provider: "gemini" (default), "perplexity", or "extension"
+URL_FINDER_PROVIDER = os.getenv('URL_FINDER_PROVIDER', 'gemini').lower()
 
 # Perplexity settings (optional URL finding provider)
 PERPLEXITY_API_KEY = os.getenv('PERPLEXITY_API_KEY', '')
@@ -81,7 +76,7 @@ WORKER_ENABLED = os.getenv('WORKER_ENABLED', 'false').strip().lower() in ('1', '
 WORKER_SLEEP_SECONDS = int(os.getenv('WORKER_SLEEP_SECONDS', '5'))
 WORKER_BATCH_SIZE = int(os.getenv('WORKER_BATCH_SIZE', '10'))
 WORKER_MAX_RETRIES = int(os.getenv('WORKER_MAX_RETRIES', '3'))
-PROVIDER_PRIORITY = [p.strip() for p in os.getenv('PROVIDER_PRIORITY', 'gemini,perplexity,cse').split(',') if p.strip()]
+PROVIDER_PRIORITY = [p.strip() for p in os.getenv('PROVIDER_PRIORITY', 'gemini,perplexity').split(',') if p.strip()]
 AUTO_SAVE_THRESHOLD = float(os.getenv('AUTO_SAVE_THRESHOLD', '0.7'))
 LOW_CONFIDENCE_THRESHOLD = float(os.getenv('LOW_CONFIDENCE_THRESHOLD', '0.5'))
 

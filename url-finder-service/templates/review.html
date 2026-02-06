@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Stores Needing Review</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div style="display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap;">
+                <div>
+                    <h1>Stores Needing Review</h1>
+                    <p>Review low-confidence URL matches and select the correct URL.</p>
+                </div>
+                <a href="/" style="color: #3498db; text-decoration: none; font-weight: 500; padding: 10px 20px; border: 2px solid #3498db; border-radius: 4px;">← Back to Processing</a>
+            </div>
+        </header>
+
+        <div class="main-content">
+            <div class="section">
+                <div id="review-status" class="status"></div>
+                <div id="review-stores-list" style="margin-top: 15px;">
+                    <p style="color: #666;">Loading stores needing review...</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="{{ url_for('static', filename='js/review.js') }}"></script>
+</body>
+</html>

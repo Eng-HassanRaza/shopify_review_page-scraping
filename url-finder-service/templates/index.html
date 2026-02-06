@@ -60,6 +60,7 @@
             <div class="section">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;">
                     <h2 style="margin: 0;">Step 2: Find Store URLs</h2>
+                    <a href="/review" class="btn-small" style="background: #ff9800; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: 500; text-decoration: none;">📋 Review Stores</a>
                     <div style="display: flex; gap: 15px; align-items: center; flex-wrap: wrap;">
                         <div style="display: flex; align-items: center; gap: 8px;">
                             <label for="app-filter" style="font-size: 13px; color: #666;">Filter by app:</label>
@@ -70,9 +71,8 @@
                         <div style="display: flex; align-items: center; gap: 8px;">
                             <label for="url-finder-provider" style="font-size: 13px; color: #666;">URL source:</label>
                             <select id="url-finder-provider" style="padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; min-width: 160px; font-size: 13px;">
-                                <option value="cse">Google CSE (default)</option>
-                                <option value="perplexity">Perplexity</option>
                                 <option value="gemini">Gemini (Google Search)</option>
+                                <option value="perplexity">Perplexity</option>
                                 <option value="extension">Chrome Extension</option>
                             </select>
                         </div>
@@ -90,6 +90,62 @@
                         <button id="stop-url-finding" class="btn-small" style="display: none; background: #e74c3c; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: 500;">⏸ Stop URL Finding</button>
                     </div>
                 </div>
+                
+                <!-- Worker Status Section -->
+                <div id="worker-status-section" style="margin-bottom: 20px; padding: 15px; background: #f8f9fa; border-radius: 4px; border: 1px solid #dee2e6;">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; flex-wrap: wrap; gap: 10px;">
+                        <div>
+                            <h3 style="margin: 0; font-size: 16px;">🔍 URL Finding Worker Status</h3>
+                            <p style="margin: 5px 0 0 0; font-size: 12px; color: #666;">Automated background URL finding service</p>
+                        </div>
+                        <button id="worker-start-stop-btn" class="btn-small" style="background: #27ae60; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: 500;">Start Worker</button>
+                    </div>
+                    
+                    <!-- Status Overview -->
+                    <div id="worker-status-content" style="margin-bottom: 15px;">
+                        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin-bottom: 15px;">
+                            <div style="padding: 10px; background: white; border-radius: 4px; border-left: 4px solid #3498db;">
+                                <div style="font-size: 11px; color: #666; margin-bottom: 3px;">Status</div>
+                                <div style="font-size: 16px; font-weight: bold; color: #3498db;" id="worker-status-text">Checking...</div>
+                            </div>
+                            <div style="padding: 10px; background: white; border-radius: 4px; border-left: 4px solid #8e44ad;">
+                                <div style="font-size: 11px; color: #666; margin-bottom: 3px;">Provider</div>
+                                <div style="font-size: 14px; font-weight: bold; color: #8e44ad;" id="worker-provider">-</div>
+                            </div>
+                            <div style="padding: 10px; background: white; border-radius: 4px; border-left: 4px solid #95a5a6;">
+                                <div style="font-size: 11px; color: #666; margin-bottom: 3px;">Pending</div>
+                                <div style="font-size: 16px; font-weight: bold; color: #95a5a6;" id="worker-pending">0</div>
+                            </div>
+                            <div style="padding: 10px; background: white; border-radius: 4px; border-left: 4px solid #27ae60;">
+                                <div style="font-size: 11px; color: #666; margin-bottom: 3px;">Saved</div>
+                                <div style="font-size: 16px; font-weight: bold; color: #27ae60;" id="worker-saved">0</div>
+                            </div>
+                            <div style="padding: 10px; background: white; border-radius: 4px; border-left: 4px solid #f39c12;">
+                                <div style="font-size: 11px; color: #666; margin-bottom: 3px;">Review</div>
+                                <div style="font-size: 16px; font-weight: bold; color: #f39c12;" id="worker-review">0</div>
+                            </div>
+                            <div style="padding: 10px; background: white; border-radius: 4px; border-left: 4px solid #e74c3c;">
+                                <div style="font-size: 11px; color: #666; margin-bottom: 3px;">Errors</div>
+                                <div style="font-size: 16px; font-weight: bold; color: #e74c3c;" id="worker-errors">0</div>
+                            </div>
+                        </div>
+                        
+                        <!-- Current Processing -->
+                        <div id="worker-current-processing" style="padding: 10px; background: white; border-radius: 4px; margin-bottom: 15px; border-left: 4px solid #3498db;">
+                            <div style="font-size: 12px; color: #666; margin-bottom: 5px;">Currently Processing:</div>
+                            <div style="font-size: 14px; font-weight: 500;" id="worker-current-store">-</div>
+                        </div>
+                        
+                        <!-- Recently Processed Stores -->
+                        <div id="worker-recent-stores" style="display: none;">
+                            <div style="font-size: 13px; font-weight: 600; margin-bottom: 10px; color: #333;">Recently Processed Stores:</div>
+                            <div id="worker-recent-stores-list" style="max-height: 300px; overflow-y: auto;">
+                                <!-- Will be populated by JavaScript -->
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                
                 <div id="stores-container">
                     <p>No stores pending. Start scraping reviews first.</p>
                 </div>

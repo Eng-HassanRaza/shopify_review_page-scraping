@@ -12,9 +12,19 @@ class URLValidator:
     """Validates URLs by checking DNS resolution and HTTP status"""
     
     def __init__(self, timeout: int = 10, follow_redirects: bool = True, max_redirects: int = 3):
+        """
+        Initialize URL validator.
+        
+        Args:
+            timeout: Request timeout in seconds
+            follow_redirects: Whether to follow HTTP redirects (requests library handles this automatically)
+            max_redirects: Maximum redirects to follow (not used by requests library, kept for API compatibility)
+        """
         self.timeout = timeout
         self.follow_redirects = follow_redirects
-        self.max_redirects = max_redirects
+        # Note: requests library doesn't support max_redirects parameter directly
+        # It follows redirects automatically when allow_redirects=True
+        self.max_redirects = max_redirects  # Kept for API compatibility but not used
     
     def validate_url(self, url: str) -> Dict[str, any]:
         """
@@ -94,8 +104,7 @@ class URLValidator:
                         url,
                         headers=headers,
                         timeout=self.timeout,
-                        allow_redirects=self.follow_redirects,
-                        max_redirects=self.max_redirects if self.follow_redirects else 0
+                        allow_redirects=self.follow_redirects
                     )
                 except requests.exceptions.RequestException:
                     # If HEAD fails, try GET
@@ -104,7 +113,6 @@ class URLValidator:
                         headers=headers,
                         timeout=self.timeout,
                         allow_redirects=self.follow_redirects,
-                        max_redirects=self.max_redirects if self.follow_redirects else 0,
                         stream=True  # Don't download full content
                     )
                     # Close the connection immediately

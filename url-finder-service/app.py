@@ -12,9 +12,6 @@ from config import (
     PORT,
     DEBUG,
     DATABASE_URL,
-    GOOGLE_CSE_API_KEY,
-    GOOGLE_CSE_CX,
-    GOOGLE_CSE_TIMEOUT,
     URL_FINDER_PROVIDER,
     PERPLEXITY_API_KEY,
     PERPLEXITY_MODEL,
@@ -39,10 +36,9 @@ from database import Database
 from modules.review_scraper import ReviewScraper
 from modules.url_finder import URLFinder
 from modules.ai_url_selector import AIURLSelector
-from modules.google_custom_search import GoogleCustomSearch
 from modules.perplexity_search import PerplexitySearch
 from modules.gemini_search import GeminiSearch
-from typing import Optional
+from typing import Optional, Dict, Any
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -59,14 +55,6 @@ CORS(app, resources={
 db = Database(DATABASE_URL)
 review_scraper = ReviewScraper()
 url_finder = URLFinder(headless=False)  # Visible browser for manual search
-
-# Initialize Google CSE client (if configured)
-google_cse = None
-if GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX:
-    google_cse = GoogleCustomSearch(GOOGLE_CSE_API_KEY, GOOGLE_CSE_CX, timeout=GOOGLE_CSE_TIMEOUT)
-    logger.info("Google CSE client initialized")
-else:
-    logger.warning("Google CSE not configured. Set GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX to enable.")
 
 # Initialize Perplexity client (if configured)
 perplexity = None
@@ -129,12 +117,16 @@ def data_page():
     """Data display page"""
     return render_template('data.html')
 
+@app.route('/review')
+def review_page():
+    """Review page for manual URL selection"""
+    return render_template('review.html')
+
 @app.route('/api/url-finder/config', methods=['GET'])
 def get_url_finder_config():
     """Expose URL finder configuration to the frontend"""
     return jsonify({
         'default_provider': URL_FINDER_PROVIDER,
-        'cse_configured': bool(google_cse),
         'perplexity_configured': bool(perplexity),
         'perplexity_autosave_threshold': PERPLEXITY_AUTOSAVE_THRESHOLD,
         'gemini_configured': bool(gemini),
@@ -719,33 +711,6 @@ def request_search():
         'message': 'Search request created. Extension will process it.'
     })
 
-@app.route('/api/search/cse', methods=['POST'])
-def search_cse():
-    """Search Google Custom Search API for store URLs"""
-    if not google_cse:
-        return jsonify({
-            'error': 'Google Custom Search is not configured. Set GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX.'
-        }), 500
-
-    data = request.json or {}
-    store_name = (data.get('store_name') or '').strip()
-    country = (data.get('country') or '').strip()
-
-    if not store_name:
-        return jsonify({'error': 'store_name is required'}), 400
-
-    query = f"{store_name} {country}".strip()
-    try:
-        results = google_cse.search(query, num=10)
-        return jsonify({
-            'query': query,
-            'results': results
-        })
-    except Exception as e:
-        logger.error(f"CSE search failed: {e}", exc_info=True)
-        return jsonify({'error': f'CSE search failed: {str(e)}'}), 500
-
-
 @app.route('/api/search/perplexity', methods=['POST'])
 def search_perplexity():
     """Use Perplexity to find/rank store URLs with confidence."""
@@ -782,15 +747,178 @@ def search_perplexity():
         return jsonify({'error': f'Perplexity search failed: {str(e)}'}), 500
 
 
+def process_and_save_url(store_id: int, url: str, confidence: Optional[float], provider: str, reasoning: str, candidate_results: list) -> Dict[str, Any]:
+    """
+    Process URL from Gemini/Perplexity: validate, try candidates if needed, and save or mark for review.
+    Returns dict with 'success', 'action', 'url', 'error' keys.
+    """
+    from modules.url_finder import URLFinder
+    from config import AUTO_SAVE_THRESHOLD, LOW_CONFIDENCE_THRESHOLD
+    
+    url_finder = URLFinder(headless=True)
+
+    def save_candidate_urls(primary_url: Optional[str], candidates: list):
+        urls = []
+        if candidates:
+            for candidate in candidates[:10]:
+                if isinstance(candidate, dict):
+                    candidate_url = candidate.get('url', '')
+                else:
+                    candidate_url = str(candidate) if candidate else ''
+                if candidate_url:
+                    urls.append(candidate_url)
+        if primary_url:
+            urls.insert(0, primary_url)
+        # De-duplicate while preserving order
+        seen = set()
+        deduped = []
+        for u in urls:
+            if u not in seen:
+                seen.add(u)
+                deduped.append(u)
+        db.save_store_candidate_urls(store_id, deduped)
+    
+    # Validate URL if validation is enabled
+    validated_url = url
+    validation_error = None
+    if URL_VALIDATION_ENABLED:
+        try:
+            from modules.url_validator import URLValidator
+            validator = URLValidator(
+                timeout=URL_VALIDATION_TIMEOUT,
+                follow_redirects=URL_VALIDATION_FOLLOW_REDIRECTS
+            )
+            validation_result = validator.validate_url(url)
+            if not validation_result['is_valid']:
+                logger.warning(
+                    f"Store {store_id}: Primary URL validation failed: {url} - "
+                    f"{validation_result.get('error')} ({validation_result.get('error_type')})"
+                )
+                validation_error = validation_result.get('error')
+                
+                # Try alternative candidates from results
+                if candidate_results:
+                    logger.info(f"Store {store_id}: Trying {len(candidate_results)} alternative candidate URLs")
+                    for candidate in candidate_results[:5]:  # Try up to 5 candidates
+                        if isinstance(candidate, dict):
+                            candidate_url = candidate.get('url', '')
+                        else:
+                            candidate_url = str(candidate) if candidate else ''
+                        
+                        if candidate_url and candidate_url != url:
+                            candidate_validation = validator.validate_url(candidate_url)
+                            if candidate_validation['is_valid']:
+                                logger.info(f"Store {store_id}: Found valid alternative URL: {candidate_url}")
+                                validated_url = candidate_url
+                                validation_error = None
+                                # Update confidence slightly lower for alternative
+                                if confidence:
+                                    confidence = max(0.0, confidence - 0.1)
+                                break
+        except Exception as e:
+            logger.error(f"URL validation error for store {store_id}: {e}", exc_info=True)
+            # Continue without validation if validator fails
+    
+    # If validation failed and no valid candidate found
+    if validation_error:
+        error_msg = f"URL validation failed: {validation_error}"
+        if not candidate_results:
+            error_msg += ". No alternative candidates available."
+        else:
+            error_msg += f". Tried {len(candidate_results)} alternatives, all failed validation."
+        
+        # If high confidence but validation failed, mark for review
+        if confidence and confidence >= AUTO_SAVE_THRESHOLD:
+            save_candidate_urls(url, candidate_results)
+            db.mark_store_needs_review(store_id, error_msg, provider, confidence)
+            return {
+                'success': True,
+                'action': 'needs_review',
+                'url': url,
+                'confidence': confidence,
+                'provider': provider,
+                'error': error_msg
+            }
+        else:
+            # Low confidence + validation failed = not found
+            db.mark_store_not_found(store_id, error_msg, provider)
+            return {
+                'success': False,
+                'action': 'not_found',
+                'url': url,
+                'confidence': confidence,
+                'provider': provider,
+                'error': error_msg
+            }
+    
+    # Determine action based on confidence
+    if confidence and confidence >= AUTO_SAVE_THRESHOLD:
+        # High confidence - auto-save (URL is validated if validation enabled)
+        try:
+            cleaned_url = url_finder.clean_url(validated_url)
+            db.update_store_url(store_id, cleaned_url, confidence=confidence, provider=provider)
+            logger.info(
+                f"Store {store_id}: Auto-saved URL {cleaned_url} "
+                f"with {confidence:.2%} confidence via {provider}"
+            )
+            return {
+                'success': True,
+                'action': 'saved',
+                'url': cleaned_url,
+                'confidence': confidence,
+                'provider': provider,
+                'error': None
+            }
+        except Exception as e:
+            error_msg = f"Failed to save URL: {str(e)}"
+            logger.error(f"Store {store_id}: {error_msg}", exc_info=True)
+            save_candidate_urls(validated_url, candidate_results)
+            db.mark_store_needs_review(store_id, error_msg, provider, confidence)
+            return {
+                'success': False,
+                'action': 'error',
+                'url': validated_url,
+                'confidence': confidence,
+                'provider': provider,
+                'error': error_msg
+            }
+    elif confidence and confidence >= LOW_CONFIDENCE_THRESHOLD:
+        # Medium confidence - needs review
+        reason = f"Low confidence ({confidence:.2%}): {reasoning}"
+        save_candidate_urls(validated_url, candidate_results)
+        db.mark_store_needs_review(store_id, reason, provider, confidence)
+        return {
+            'success': True,
+            'action': 'needs_review',
+            'url': validated_url,
+            'confidence': confidence,
+            'provider': provider,
+            'error': None
+        }
+    else:
+        # Low confidence - not found
+        error_msg = f"Low confidence ({confidence:.2% if confidence else 'unknown'})"
+        db.mark_store_not_found(store_id, error_msg, provider)
+        return {
+            'success': False,
+            'action': 'not_found',
+            'url': validated_url,
+            'confidence': confidence,
+            'provider': provider,
+            'error': error_msg
+        }
+
 @app.route('/api/search/gemini', methods=['POST'])
 def search_gemini():
-    """Use Gemini with Google Search tool to find/rank store URLs with confidence."""
+    """Use Gemini with Google Search tool to find/rank store URLs with confidence.
+    If store_id is provided, automatically processes and saves the URL."""
     if not gemini:
         return jsonify({
             'error': 'Gemini is not configured. Set GEMINI_API_KEY (or GOOGLE_API_KEY).'
         }), 500
 
     data = request.json or {}
+    store_id = data.get('store_id')  # Optional: if provided, auto-save
     store_name = (data.get('store_name') or '').strip()
     country = (data.get('country') or '').strip()
     review_text = (data.get('review_text') or '').strip()
@@ -804,6 +932,49 @@ def search_gemini():
             country=country,
             review_text=review_text,
         )
+        
+        # If store_id provided, auto-process and save
+        if store_id:
+            selected_url = result.get('selected_url')
+            confidence = result.get('confidence')
+            reasoning = result.get('reasoning', '')
+            candidate_results = result.get('results', [])
+            
+            if not selected_url:
+                # No URL found
+                db.mark_store_not_found(store_id, 'No URL returned from Gemini', 'gemini')
+                return jsonify({
+                    'success': False,
+                    'action': 'not_found',
+                    'error': 'No URL found',
+                    'query': result.get('query'),
+                    'results': candidate_results
+                }), 200
+            
+            # Process and save URL
+            process_result = process_and_save_url(
+                store_id=store_id,
+                url=selected_url,
+                confidence=confidence,
+                provider='gemini',
+                reasoning=reasoning,
+                candidate_results=candidate_results
+            )
+            
+            return jsonify({
+                'success': process_result['success'],
+                'action': process_result['action'],
+                'url': process_result.get('url'),
+                'confidence': process_result.get('confidence'),
+                'provider': process_result.get('provider'),
+                'error': process_result.get('error'),
+                'query': result.get('query'),
+                'results': candidate_results,
+                'reasoning': reasoning,
+                'duration_ms': result.get('duration_ms'),
+            })
+        
+        # Legacy mode: return results for manual selection
         return jsonify({
             'query': result.get('query'),
             'results': result.get('results', []),
@@ -820,7 +991,7 @@ def search_gemini():
         return jsonify({
             'error': error_msg,
             'error_type': 'rate_limit_exhausted',
-            'suggestion': 'Please try again in a few moments, or switch to another provider (CSE/Perplexity/Extension).'
+            'suggestion': 'Please try again in a few moments, or switch to another provider (Perplexity/Extension).'
         }), 429
     except Exception as e:
         error_msg = str(e)
@@ -830,7 +1001,7 @@ def search_gemini():
             return jsonify({
                 'error': 'Gemini API rate limit exceeded. The system will retry automatically, but you may want to try again later or use another provider.',
                 'error_type': 'rate_limit',
-                'suggestion': 'Consider switching to Google CSE, Perplexity, or Chrome Extension provider.'
+                'suggestion': 'Consider switching to Perplexity or Chrome Extension provider.'
             }), 429
         return jsonify({'error': f'Gemini search failed: {error_msg}'}), 500
 
@@ -1017,15 +1188,18 @@ def get_statistics():
 # Global worker instance (will be initialized if WORKER_ENABLED)
 worker = None
 worker_thread = None
+current_worker_provider = URL_FINDER_PROVIDER
 
-def init_worker():
+def init_worker(selected_provider: str = None):
     """Initialize background worker if enabled"""
     global worker
-    from config import WORKER_ENABLED
+    from config import WORKER_ENABLED, URL_FINDER_PROVIDER
     if WORKER_ENABLED:
         from modules.background_worker import BackgroundWorker
-        worker = BackgroundWorker(db)
-        logger.info("Background worker initialized")
+        # Use provided provider or fallback to URL_FINDER_PROVIDER
+        provider = selected_provider or current_worker_provider or URL_FINDER_PROVIDER
+        worker = BackgroundWorker(db, selected_provider=provider)
+        logger.info(f"Background worker initialized with provider: {provider}")
     return worker
 
 @app.route('/api/health', methods=['GET'])
@@ -1054,7 +1228,6 @@ def health_check():
     health['providers'] = {
         'gemini': gemini is not None,
         'perplexity': perplexity is not None,
-        'google_cse': google_cse is not None,
     }
     
     # Check worker status
@@ -1070,11 +1243,17 @@ def health_check():
 @app.route('/api/worker/start', methods=['POST'])
 def start_worker():
     """Start background worker"""
-    global worker, worker_thread
+    global worker, worker_thread, current_worker_provider
     import threading
+    data = request.json or {}
+    requested_provider = (data.get('provider') or '').strip().lower()
+    if requested_provider:
+        if requested_provider not in ['gemini', 'perplexity', 'extension']:
+            return jsonify({'error': 'Invalid provider. Must be: gemini, perplexity, or extension'}), 400
+        current_worker_provider = requested_provider
     
     if worker is None:
-        worker = init_worker()
+        worker = init_worker(selected_provider=current_worker_provider)
     
     if worker is None:
         return jsonify({
@@ -1136,9 +1315,60 @@ def get_worker_status():
             'message': 'Worker not enabled'
         })
     
+    status = worker.get_status()
+    # Add selected provider info
+    status['selected_provider'] = worker.selected_provider or current_worker_provider
+    
     return jsonify({
         'enabled': True,
-        'status': worker.get_status()
+        'status': status
+    })
+
+@app.route('/api/worker/provider', methods=['GET', 'POST'])
+def worker_provider():
+    """Get or set the selected provider for the worker"""
+    global worker, worker_thread, current_worker_provider
+    
+    if request.method == 'POST':
+        data = request.json or {}
+        provider = data.get('provider', '').strip().lower()
+        
+        if provider not in ['gemini', 'perplexity', 'extension']:
+            return jsonify({'error': 'Invalid provider. Must be: gemini, perplexity, or extension'}), 400
+        
+        current_worker_provider = provider
+        # If worker is running, stop it first
+        was_running = False
+        if worker and worker.running:
+            was_running = True
+            worker.stop()
+            if worker_thread and worker_thread.is_alive():
+                worker_thread.join(timeout=5)
+        
+        # Reinitialize worker with new provider
+        worker = init_worker(selected_provider=provider)
+        
+        # Restart if it was running
+        if was_running and worker:
+            worker_thread = threading.Thread(target=worker.run_continuous, daemon=True)
+            worker_thread.start()
+            logger.info(f"Worker restarted with provider: {provider}")
+        
+        return jsonify({
+            'success': True,
+            'provider': provider,
+            'message': f'Worker provider set to {provider}',
+            'status': worker.get_status() if worker else None
+        })
+    
+    # GET - return current provider
+    if worker and hasattr(worker, 'selected_provider') and worker.selected_provider:
+        provider = worker.selected_provider
+    else:
+        provider = current_worker_provider or URL_FINDER_PROVIDER
+    
+    return jsonify({
+        'provider': provider
     })
 
 @app.route('/api/worker/process-store/<int:store_id>', methods=['POST'])
@@ -1191,6 +1421,51 @@ def process_store_manual(store_id):
         return jsonify({
             'error': str(e)
         }), 500
+
+@app.route('/api/stores/review', methods=['GET'])
+def get_stores_needing_review():
+    """Get stores that need manual review"""
+    limit = request.args.get('limit', type=int)
+    app_name = _app_name_from_request()
+    
+    stores = db.get_stores_needing_review(limit=limit, app_name=app_name)
+    
+    # Add candidate URLs to each store
+    for store in stores:
+        store['candidate_urls'] = db.get_store_candidate_urls(store['id'])
+    
+    return jsonify(stores)
+
+@app.route('/api/stores/<int:store_id>/review/select-url', methods=['POST'])
+def select_url_for_review(store_id):
+    """Manually select a URL for a store in review"""
+    data = request.json or {}
+    url = data.get('url')
+    
+    if not url:
+        return jsonify({'error': 'url is required'}), 400
+    
+    # Get store to verify it's in review status
+    store = db.get_store(store_id)
+    if not store:
+        return jsonify({'error': 'Store not found'}), 404
+    
+    if store.get('status') != 'needs_review':
+        return jsonify({
+            'error': f'Store is not in review status (current: {store.get("status")})'
+        }), 400
+    
+    # Update store with selected URL
+    cleaned_url = url_finder.clean_url(url)
+    db.update_store_url(store_id, cleaned_url, confidence=store.get('url_confidence'), provider=store.get('url_finding_provider'))
+    
+    logger.info(f"Manually selected URL for review store {store_id}: {cleaned_url}")
+    
+    return jsonify({
+        'success': True,
+        'url': cleaned_url,
+        'message': 'URL selected and saved successfully'
+    })
 
 if __name__ == '__main__':
     logger.info(f"Starting URL Finder Service on {HOST}:{PORT}")
