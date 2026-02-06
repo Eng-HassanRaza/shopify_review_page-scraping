@@ -2,6 +2,7 @@
 import psycopg2
 import psycopg2.extras
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -19,10 +20,19 @@ class Database:
         self.database_url = database_url or DATABASE_URL
         self.init_database()
     
-    def get_connection(self):
-        """Get database connection"""
-        conn = psycopg2.connect(self.database_url)
-        return conn
+    def get_connection(self, retries: int = 3, retry_delay: float = 1.0):
+        """Get database connection with retry logic"""
+        for attempt in range(retries):
+            try:
+                conn = psycopg2.connect(self.database_url)
+                return conn
+            except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+                if attempt < retries - 1:
+                    logger.warning(f"Database connection failed (attempt {attempt + 1}/{retries}): {e}. Retrying...")
+                    time.sleep(retry_delay * (attempt + 1))  # Exponential backoff
+                else:
+                    logger.error(f"Database connection failed after {retries} attempts: {e}")
+                    raise
     
     def init_database(self):
         """Initialize database schema"""
@@ -76,10 +86,16 @@ class Database:
         
         conn.commit()
         
+        # Helper function to check if column exists
+        def column_exists(table_name, column_name):
+            cursor.execute("""
+                SELECT COUNT(*) FROM information_schema.columns
+                WHERE table_name = %s AND column_name = %s
+            """, (table_name, column_name))
+            return cursor.fetchone()[0] > 0
+        
         # Migrate existing jobs table if needed
-        try:
-            cursor.execute("SELECT progress_message FROM jobs LIMIT 1")
-        except psycopg2.errors.UndefinedColumn:
+        if not column_exists('jobs', 'progress_message'):
             logger.info("Migrating jobs table...")
             cursor.execute("ALTER TABLE jobs ADD COLUMN progress_message TEXT")
             cursor.execute("ALTER TABLE jobs ADD COLUMN current_page INTEGER DEFAULT 0")
@@ -89,14 +105,22 @@ class Database:
             logger.info("Migration complete")
         
         # Add max_reviews_limit and max_pages_limit columns if they don't exist
-        try:
-            cursor.execute("SELECT max_reviews_limit FROM jobs LIMIT 1")
-        except psycopg2.errors.UndefinedColumn:
+        if not column_exists('jobs', 'max_reviews_limit'):
             logger.info("Adding limit columns to jobs table...")
             cursor.execute("ALTER TABLE jobs ADD COLUMN max_reviews_limit INTEGER DEFAULT 0")
             cursor.execute("ALTER TABLE jobs ADD COLUMN max_pages_limit INTEGER DEFAULT 0")
             conn.commit()
             logger.info("Limit columns added")
+        
+        # Add URL finding tracking columns to stores table if they don't exist
+        if not column_exists('stores', 'url_finding_attempts'):
+            logger.info("Adding URL finding tracking columns to stores table...")
+            cursor.execute("ALTER TABLE stores ADD COLUMN url_finding_attempts INTEGER DEFAULT 0")
+            cursor.execute("ALTER TABLE stores ADD COLUMN url_finding_error TEXT")
+            cursor.execute("ALTER TABLE stores ADD COLUMN url_finding_provider TEXT")
+            cursor.execute("ALTER TABLE stores ADD COLUMN url_confidence FLOAT")
+            conn.commit()
+            logger.info("URL finding columns added")
         
         conn.close()
         logger.info("Database initialized")
@@ -393,17 +417,36 @@ class Database:
         conn.commit()
         conn.close()
     
-    def update_store_url(self, store_id: int, url: str):
+    def update_store_url(self, store_id: int, url: str, confidence: float = None, provider: str = None):
         """Update store with verified URL"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        cursor.execute("""
+        updates = [
+            "base_url = %s",
+            "url_verified = TRUE",
+            "verified_at = CURRENT_TIMESTAMP",
+            "status = 'url_verified'",
+            "updated_at = CURRENT_TIMESTAMP",
+            "url_finding_error = NULL"  # Clear any previous errors
+        ]
+        params = [url]
+        
+        if confidence is not None:
+            updates.append("url_confidence = %s")
+            params.append(confidence)
+        
+        if provider:
+            updates.append("url_finding_provider = %s")
+            params.append(provider)
+        
+        params.append(store_id)
+        
+        cursor.execute(f"""
             UPDATE stores
-            SET base_url = %s, url_verified = TRUE, verified_at = CURRENT_TIMESTAMP,
-                status = 'url_verified', updated_at = CURRENT_TIMESTAMP
+            SET {', '.join(updates)}
             WHERE id = %s
-        """, (url, store_id))
+        """, params)
         
         conn.commit()
         conn.close()
@@ -590,3 +633,209 @@ class Database:
         if stats.get('total_emails') is None:
             stats['total_emails'] = 0
         return stats
+    
+    def lock_store_for_processing(self, store_id: int) -> bool:
+        """Lock a store for processing using SELECT FOR UPDATE. Returns True if locked successfully."""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        try:
+            # Use SELECT FOR UPDATE NOWAIT to prevent blocking
+            cursor.execute("""
+                SELECT id FROM stores
+                WHERE id = %s AND (status != 'processing' OR updated_at < NOW() - INTERVAL '30 minutes')
+                FOR UPDATE NOWAIT
+            """, (store_id,))
+            
+            if cursor.fetchone():
+                # Lock acquired, mark as processing
+                cursor.execute("""
+                    UPDATE stores
+                    SET status = 'processing', updated_at = CURRENT_TIMESTAMP
+                    WHERE id = %s
+                """, (store_id,))
+                conn.commit()
+                conn.close()
+                return True
+            else:
+                conn.rollback()
+                conn.close()
+                return False
+        except psycopg2.OperationalError:
+            # Lock failed (another process is processing this store)
+            conn.rollback()
+            conn.close()
+            return False
+    
+    def unlock_store(self, store_id: int):
+        """Remove processing lock from a store (revert to pending_url if no URL found)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE stores
+            SET status = CASE 
+                WHEN base_url IS NOT NULL AND base_url != '' THEN status
+                ELSE 'pending_url'
+            END,
+            updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s AND status = 'processing'
+        """, (store_id,))
+        
+        conn.commit()
+        conn.close()
+    
+    def mark_store_needs_review(self, store_id: int, reason: str = None, provider: str = None, confidence: float = None):
+        """Mark store as needing manual review (low confidence result)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        updates = [
+            "status = 'needs_review'",
+            "updated_at = CURRENT_TIMESTAMP"
+        ]
+        params = []
+        
+        if reason:
+            updates.append("url_finding_error = %s")
+            params.append(reason)
+        
+        if provider:
+            updates.append("url_finding_provider = %s")
+            params.append(provider)
+        
+        if confidence is not None:
+            updates.append("url_confidence = %s")
+            params.append(confidence)
+        
+        params.append(store_id)
+        
+        cursor.execute(f"""
+            UPDATE stores
+            SET {', '.join(updates)}
+            WHERE id = %s
+        """, params)
+        
+        conn.commit()
+        conn.close()
+    
+    def mark_store_not_found(self, store_id: int, reason: str = None, provider: str = None):
+        """Mark store as not found (no results from any provider)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        updates = [
+            "status = 'not_found'",
+            "updated_at = CURRENT_TIMESTAMP"
+        ]
+        params = []
+        
+        if reason:
+            updates.append("url_finding_error = %s")
+            params.append(reason)
+        
+        if provider:
+            updates.append("url_finding_provider = %s")
+            params.append(provider)
+        
+        params.append(store_id)
+        
+        cursor.execute(f"""
+            UPDATE stores
+            SET {', '.join(updates)}
+            WHERE id = %s
+        """, params)
+        
+        conn.commit()
+        conn.close()
+    
+    def increment_url_finding_attempts(self, store_id: int):
+        """Increment the retry attempt counter for a store"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE stores
+            SET url_finding_attempts = url_finding_attempts + 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (store_id,))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_pending_stores_excluding_processing(self, limit: int = None, app_name: str = None) -> List[Dict]:
+        """Get stores that need URL finding, excluding those currently being processed"""
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        query = """
+            SELECT * FROM stores
+            WHERE (status = 'pending_url' OR status = 'url_found')
+            AND (status != 'processing' OR updated_at < NOW() - INTERVAL '30 minutes')
+        """
+        params = []
+        
+        if app_name:
+            query += " AND app_name = %s"
+            params.append(app_name)
+        
+        query += " ORDER BY id"
+        
+        if limit:
+            query += " LIMIT %s"
+            params.append(limit)
+        
+        if params:
+            cursor.execute(query, params)
+        else:
+            cursor.execute(query)
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        stores = []
+        for row in rows:
+            store = dict(row)
+            if store.get('emails'):
+                try:
+                    store['emails'] = json.loads(store['emails'])
+                except:
+                    store['emails'] = []
+            else:
+                store['emails'] = []
+            if store.get('raw_emails'):
+                try:
+                    store['raw_emails'] = json.loads(store['raw_emails'])
+                except:
+                    store['raw_emails'] = []
+            else:
+                store['raw_emails'] = []
+            stores.append(store)
+        
+        return stores
+    
+    def unlock_stuck_stores(self, timeout_minutes: int = 30) -> int:
+        """Unlock stores that have been stuck in processing status for too long"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE stores
+            SET status = CASE 
+                WHEN base_url IS NOT NULL AND base_url != '' THEN status
+                ELSE 'pending_url'
+            END,
+            updated_at = CURRENT_TIMESTAMP
+            WHERE status = 'processing'
+            AND updated_at < NOW() - INTERVAL '%s minutes'
+        """, (timeout_minutes,))
+        
+        unlocked_count = cursor.rowcount
+        conn.commit()
+        conn.close()
+        
+        if unlocked_count > 0:
+            logger.info(f"Unlocked {unlocked_count} stuck stores")
+        
+        return unlocked_count

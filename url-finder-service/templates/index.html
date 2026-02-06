@@ -67,6 +67,15 @@
                                 <option value="">All apps</option>
                             </select>
                         </div>
+                        <div style="display: flex; align-items: center; gap: 8px;">
+                            <label for="url-finder-provider" style="font-size: 13px; color: #666;">URL source:</label>
+                            <select id="url-finder-provider" style="padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; min-width: 160px; font-size: 13px;">
+                                <option value="cse">Google CSE (default)</option>
+                                <option value="perplexity">Perplexity</option>
+                                <option value="gemini">Gemini (Google Search)</option>
+                                <option value="extension">Chrome Extension</option>
+                            </select>
+                        </div>
                         <label class="auto-mode-toggle" id="auto-mode-toggle">
                             <input type="checkbox" id="auto-mode-checkbox">
                             <span class="toggle-slider"></span>

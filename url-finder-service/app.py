@@ -7,11 +7,41 @@ import time
 import json
 import uuid
 import psycopg2.extras
-from config import HOST, PORT, DEBUG, DATABASE_URL
+from config import (
+    HOST,
+    PORT,
+    DEBUG,
+    DATABASE_URL,
+    GOOGLE_CSE_API_KEY,
+    GOOGLE_CSE_CX,
+    GOOGLE_CSE_TIMEOUT,
+    URL_FINDER_PROVIDER,
+    PERPLEXITY_API_KEY,
+    PERPLEXITY_MODEL,
+    PERPLEXITY_TIMEOUT,
+    PERPLEXITY_TOP_N,
+    PERPLEXITY_AUTOSAVE_THRESHOLD,
+    PERPLEXITY_CACHE_TTL_SECONDS,
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+    GEMINI_TIMEOUT,
+    GEMINI_TOP_N,
+    GEMINI_AUTOSAVE_THRESHOLD,
+    GEMINI_CACHE_TTL_SECONDS,
+    GEMINI_VERIFY_SHOPIFY,
+    GEMINI_MAX_RETRIES,
+    GEMINI_RETRY_DELAY,
+    URL_VALIDATION_ENABLED,
+    URL_VALIDATION_TIMEOUT,
+    URL_VALIDATION_FOLLOW_REDIRECTS,
+)
 from database import Database
 from modules.review_scraper import ReviewScraper
 from modules.url_finder import URLFinder
 from modules.ai_url_selector import AIURLSelector
+from modules.google_custom_search import GoogleCustomSearch
+from modules.perplexity_search import PerplexitySearch
+from modules.gemini_search import GeminiSearch
 from typing import Optional
 
 logging.basicConfig(level=logging.INFO)
@@ -29,6 +59,45 @@ CORS(app, resources={
 db = Database(DATABASE_URL)
 review_scraper = ReviewScraper()
 url_finder = URLFinder(headless=False)  # Visible browser for manual search
+
+# Initialize Google CSE client (if configured)
+google_cse = None
+if GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX:
+    google_cse = GoogleCustomSearch(GOOGLE_CSE_API_KEY, GOOGLE_CSE_CX, timeout=GOOGLE_CSE_TIMEOUT)
+    logger.info("Google CSE client initialized")
+else:
+    logger.warning("Google CSE not configured. Set GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX to enable.")
+
+# Initialize Perplexity client (if configured)
+perplexity = None
+if PERPLEXITY_API_KEY:
+    perplexity = PerplexitySearch(
+        PERPLEXITY_API_KEY,
+        model=PERPLEXITY_MODEL,
+        timeout=PERPLEXITY_TIMEOUT,
+        top_n=PERPLEXITY_TOP_N,
+        cache_ttl_seconds=PERPLEXITY_CACHE_TTL_SECONDS,
+    )
+    logger.info("Perplexity client initialized")
+else:
+    logger.warning("Perplexity not configured. Set PERPLEXITY_API_KEY to enable.")
+
+# Initialize Gemini client (if configured)
+gemini = None
+if GEMINI_API_KEY:
+    gemini = GeminiSearch(
+        GEMINI_API_KEY,
+        model=GEMINI_MODEL,
+        timeout=GEMINI_TIMEOUT,
+        top_n=GEMINI_TOP_N,
+        cache_ttl_seconds=GEMINI_CACHE_TTL_SECONDS,
+        verify_shopify=GEMINI_VERIFY_SHOPIFY,
+        max_retries=GEMINI_MAX_RETRIES,
+        initial_retry_delay=GEMINI_RETRY_DELAY,
+    )
+    logger.info("Gemini client initialized")
+else:
+    logger.warning("Gemini not configured. Set GEMINI_API_KEY (or GOOGLE_API_KEY) to enable.")
 
 # Initialize AI URL Selector
 try:
@@ -59,6 +128,18 @@ def index():
 def data_page():
     """Data display page"""
     return render_template('data.html')
+
+@app.route('/api/url-finder/config', methods=['GET'])
+def get_url_finder_config():
+    """Expose URL finder configuration to the frontend"""
+    return jsonify({
+        'default_provider': URL_FINDER_PROVIDER,
+        'cse_configured': bool(google_cse),
+        'perplexity_configured': bool(perplexity),
+        'perplexity_autosave_threshold': PERPLEXITY_AUTOSAVE_THRESHOLD,
+        'gemini_configured': bool(gemini),
+        'gemini_autosave_threshold': GEMINI_AUTOSAVE_THRESHOLD,
+    })
 
 # ==================== Review Scraping Endpoints ====================
 
@@ -351,17 +432,55 @@ def get_store(store_id):
 
 @app.route('/api/stores/<int:store_id>/url', methods=['PUT'])
 def update_store_url(store_id):
-    """Update store URL"""
-    data = request.json
+    """Update store URL with optional validation"""
+    data = request.json or {}
     url = data.get('url')
+    confidence = data.get('confidence')
+    provider = data.get('provider')
+    skip_validation = data.get('skip_validation', False)  # Allow skipping validation for manual entries
     
     if not url:
         return jsonify({'error': 'url is required'}), 400
     
     cleaned_url = url_finder.clean_url(url)
-    db.update_store_url(store_id, cleaned_url)
     
-    logger.info(f"URL saved for store {store_id}: {cleaned_url}")
+    # Validate URL if enabled and not skipped
+    validation_result = None
+    if URL_VALIDATION_ENABLED and not skip_validation:
+        try:
+            from modules.url_validator import URLValidator
+            validator = URLValidator(
+                timeout=URL_VALIDATION_TIMEOUT,
+                follow_redirects=URL_VALIDATION_FOLLOW_REDIRECTS
+            )
+            validation_result = validator.validate_url(cleaned_url)
+            
+            if not validation_result['is_valid']:
+                logger.warning(
+                    f"URL validation failed for store {store_id}: {cleaned_url} - "
+                    f"{validation_result.get('error')} ({validation_result.get('error_type')})"
+                )
+                return jsonify({
+                    'success': False,
+                    'error': f"URL validation failed: {validation_result.get('error')}",
+                    'error_type': validation_result.get('error_type'),
+                    'url': cleaned_url,
+                    'validation_result': validation_result
+                }), 400
+            
+            # Use validated final URL if redirects were followed
+            if validation_result.get('final_url') and validation_result['final_url'] != cleaned_url:
+                cleaned_url = validation_result['final_url']
+                logger.info(f"URL redirected: {url} -> {cleaned_url}")
+        except Exception as e:
+            logger.error(f"URL validation error for store {store_id}: {e}", exc_info=True)
+            # Continue without validation if validator fails
+            validation_result = {'is_valid': True, 'error': f'Validation error: {str(e)}'}
+    
+    db.update_store_url(store_id, cleaned_url, confidence=confidence, provider=provider)
+    
+    validation_note = " (validated)" if validation_result and validation_result.get('is_valid') else ""
+    logger.info(f"URL saved for store {store_id}: {cleaned_url} (confidence: {confidence}, provider: {provider}){validation_note}")
     
     pending_count = db.count_pending_url_stores()
     
@@ -369,7 +488,8 @@ def update_store_url(store_id):
         'success': True, 
         'url': cleaned_url, 
         'message': 'URL saved successfully.',
-        'pending_url_count': pending_count
+        'pending_url_count': pending_count,
+        'validated': validation_result.get('is_valid') if validation_result else None
     })
 
 @app.route('/api/stores/url-finding-status', methods=['GET'])
@@ -599,6 +719,121 @@ def request_search():
         'message': 'Search request created. Extension will process it.'
     })
 
+@app.route('/api/search/cse', methods=['POST'])
+def search_cse():
+    """Search Google Custom Search API for store URLs"""
+    if not google_cse:
+        return jsonify({
+            'error': 'Google Custom Search is not configured. Set GOOGLE_CSE_API_KEY and GOOGLE_CSE_CX.'
+        }), 500
+
+    data = request.json or {}
+    store_name = (data.get('store_name') or '').strip()
+    country = (data.get('country') or '').strip()
+
+    if not store_name:
+        return jsonify({'error': 'store_name is required'}), 400
+
+    query = f"{store_name} {country}".strip()
+    try:
+        results = google_cse.search(query, num=10)
+        return jsonify({
+            'query': query,
+            'results': results
+        })
+    except Exception as e:
+        logger.error(f"CSE search failed: {e}", exc_info=True)
+        return jsonify({'error': f'CSE search failed: {str(e)}'}), 500
+
+
+@app.route('/api/search/perplexity', methods=['POST'])
+def search_perplexity():
+    """Use Perplexity to find/rank store URLs with confidence."""
+    if not perplexity:
+        return jsonify({
+            'error': 'Perplexity is not configured. Set PERPLEXITY_API_KEY.'
+        }), 500
+
+    data = request.json or {}
+    store_name = (data.get('store_name') or '').strip()
+    country = (data.get('country') or '').strip()
+    review_text = (data.get('review_text') or '').strip()
+
+    if not store_name:
+        return jsonify({'error': 'store_name is required'}), 400
+
+    try:
+        result = perplexity.find_store_url(
+            store_name=store_name,
+            country=country,
+            review_text=review_text,
+        )
+        return jsonify({
+            'query': result.get('query'),
+            'results': result.get('results', []),
+            'selected_url': result.get('selected_url'),
+            'confidence': result.get('confidence'),
+            'reasoning': result.get('reasoning', ''),
+            'duration_ms': result.get('duration_ms'),
+            'autosave_threshold': PERPLEXITY_AUTOSAVE_THRESHOLD,
+        })
+    except Exception as e:
+        logger.error(f"Perplexity search failed: {e}", exc_info=True)
+        return jsonify({'error': f'Perplexity search failed: {str(e)}'}), 500
+
+
+@app.route('/api/search/gemini', methods=['POST'])
+def search_gemini():
+    """Use Gemini with Google Search tool to find/rank store URLs with confidence."""
+    if not gemini:
+        return jsonify({
+            'error': 'Gemini is not configured. Set GEMINI_API_KEY (or GOOGLE_API_KEY).'
+        }), 500
+
+    data = request.json or {}
+    store_name = (data.get('store_name') or '').strip()
+    country = (data.get('country') or '').strip()
+    review_text = (data.get('review_text') or '').strip()
+
+    if not store_name:
+        return jsonify({'error': 'store_name is required'}), 400
+
+    try:
+        result = gemini.find_store_url(
+            store_name=store_name,
+            country=country,
+            review_text=review_text,
+        )
+        return jsonify({
+            'query': result.get('query'),
+            'results': result.get('results', []),
+            'selected_url': result.get('selected_url'),
+            'confidence': result.get('confidence'),
+            'reasoning': result.get('reasoning', ''),
+            'duration_ms': result.get('duration_ms'),
+            'autosave_threshold': GEMINI_AUTOSAVE_THRESHOLD,
+        })
+    except ValueError as e:
+        # Rate limit exhausted after retries
+        error_msg = str(e)
+        logger.warning(f"Gemini rate limit exhausted: {error_msg}")
+        return jsonify({
+            'error': error_msg,
+            'error_type': 'rate_limit_exhausted',
+            'suggestion': 'Please try again in a few moments, or switch to another provider (CSE/Perplexity/Extension).'
+        }), 429
+    except Exception as e:
+        error_msg = str(e)
+        logger.error(f"Gemini search failed: {e}", exc_info=True)
+        # Check if it's a 429 error that wasn't caught by retry logic
+        if '429' in error_msg or 'RESOURCE_EXHAUSTED' in error_msg.upper():
+            return jsonify({
+                'error': 'Gemini API rate limit exceeded. The system will retry automatically, but you may want to try again later or use another provider.',
+                'error_type': 'rate_limit',
+                'suggestion': 'Consider switching to Google CSE, Perplexity, or Chrome Extension provider.'
+            }), 429
+        return jsonify({'error': f'Gemini search failed: {error_msg}'}), 500
+
 @app.route('/api/search/poll/<search_id>', methods=['GET'])
 def poll_search_results(search_id):
     """Poll for search results"""
@@ -777,6 +1012,197 @@ def get_statistics():
     stats = db.get_statistics(job_id=job_id)
     return jsonify(stats)
 
+# ==================== Background Worker Endpoints ====================
+
+# Global worker instance (will be initialized if WORKER_ENABLED)
+worker = None
+worker_thread = None
+
+def init_worker():
+    """Initialize background worker if enabled"""
+    global worker
+    from config import WORKER_ENABLED
+    if WORKER_ENABLED:
+        from modules.background_worker import BackgroundWorker
+        worker = BackgroundWorker(db)
+        logger.info("Background worker initialized")
+    return worker
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """Health check endpoint"""
+    health = {
+        'status': 'healthy',
+        'database': 'unknown',
+        'providers': {},
+        'worker': None
+    }
+    
+    # Check database connectivity
+    try:
+        conn = db.get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT 1")
+        cursor.fetchone()
+        conn.close()
+        health['database'] = 'connected'
+    except Exception as e:
+        health['database'] = f'error: {str(e)}'
+        health['status'] = 'unhealthy'
+    
+    # Check provider availability
+    health['providers'] = {
+        'gemini': gemini is not None,
+        'perplexity': perplexity is not None,
+        'google_cse': google_cse is not None,
+    }
+    
+    # Check worker status
+    global worker
+    if worker is None:
+        worker = init_worker()
+    
+    if worker:
+        health['worker'] = worker.get_status()
+    
+    return jsonify(health)
+
+@app.route('/api/worker/start', methods=['POST'])
+def start_worker():
+    """Start background worker"""
+    global worker, worker_thread
+    import threading
+    
+    if worker is None:
+        worker = init_worker()
+    
+    if worker is None:
+        return jsonify({
+            'error': 'Worker not enabled. Set WORKER_ENABLED=true in environment.'
+        }), 400
+    
+    if worker.running:
+        return jsonify({
+            'message': 'Worker is already running',
+            'status': worker.get_status()
+        })
+    
+    # Start worker in background thread
+    worker_thread = threading.Thread(target=worker.run_continuous, daemon=True)
+    worker_thread.start()
+    
+    logger.info("Background worker started via API")
+    
+    return jsonify({
+        'message': 'Worker started',
+        'status': worker.get_status()
+    })
+
+@app.route('/api/worker/stop', methods=['POST'])
+def stop_worker():
+    """Stop background worker"""
+    global worker
+    
+    if worker is None:
+        return jsonify({
+            'error': 'Worker not initialized'
+        }), 400
+    
+    if not worker.running:
+        return jsonify({
+            'message': 'Worker is not running',
+            'status': worker.get_status()
+        })
+    
+    worker.stop()
+    logger.info("Background worker stopped via API")
+    
+    return jsonify({
+        'message': 'Worker stop requested',
+        'status': worker.get_status()
+    })
+
+@app.route('/api/worker/status', methods=['GET'])
+def get_worker_status():
+    """Get worker status"""
+    global worker
+    
+    if worker is None:
+        worker = init_worker()
+    
+    if worker is None:
+        return jsonify({
+            'enabled': False,
+            'message': 'Worker not enabled'
+        })
+    
+    return jsonify({
+        'enabled': True,
+        'status': worker.get_status()
+    })
+
+@app.route('/api/worker/process-store/<int:store_id>', methods=['POST'])
+def process_store_manual(store_id):
+    """Manually trigger processing for a specific store"""
+    global worker
+    
+    if worker is None:
+        worker = init_worker()
+    
+    if worker is None:
+        return jsonify({
+            'error': 'Worker not enabled. Set WORKER_ENABLED=true in environment.'
+        }), 400
+    
+    # Get store data
+    store = db.get_store(store_id)
+    if not store:
+        return jsonify({'error': 'Store not found'}), 404
+    
+    # Check if store already has URL
+    if store.get('base_url'):
+        return jsonify({
+            'message': 'Store already has URL',
+            'url': store.get('base_url')
+        })
+    
+    # Try to lock store
+    if not db.lock_store_for_processing(store_id):
+        return jsonify({
+            'error': 'Store is already being processed'
+        }), 409
+    
+    try:
+        # Process store
+        result = worker.process_store(store_id, store)
+        db.unlock_store(store_id)
+        
+        return jsonify({
+            'success': result['success'],
+            'action': result['action'],
+            'url': result.get('url'),
+            'confidence': result.get('confidence'),
+            'provider': result.get('provider'),
+            'error': result.get('error')
+        })
+    except Exception as e:
+        db.unlock_store(store_id)
+        logger.error(f"Error processing store {store_id}: {e}", exc_info=True)
+        return jsonify({
+            'error': str(e)
+        }), 500
+
 if __name__ == '__main__':
     logger.info(f"Starting URL Finder Service on {HOST}:{PORT}")
+    
+    # Initialize worker if enabled
+    from config import WORKER_ENABLED
+    if WORKER_ENABLED:
+        init_worker()
+        if worker:
+            import threading
+            worker_thread = threading.Thread(target=worker.run_continuous, daemon=True)
+            worker_thread.start()
+            logger.info("Background worker started automatically")
+    
     app.run(host=HOST, port=PORT, debug=DEBUG)

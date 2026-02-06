@@ -1,0 +1,23 @@
+[Unit]
+Description=URL Finder Background Worker
+After=network.target postgresql.service
+Wants=postgresql.service
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/shopify_review_page-scraping/url-finder-service
+Environment="PATH=/home/ubuntu/shopify_review_page-scraping/venv/bin"
+Environment="PYTHONPATH=/home/ubuntu/shopify_review_page-scraping/url-finder-service"
+ExecStart=/home/ubuntu/shopify_review_page-scraping/venv/bin/python /home/ubuntu/shopify_review_page-scraping/url-finder-service/worker.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# Resource limits
+LimitNOFILE=65536
+MemoryLimit=2G
+
+[Install]
+WantedBy=multi-user.target

@@ -12,6 +12,7 @@ let urlFindingActive = false; // Track if URL finding is actively running
 let jobsList = [];
 let selectedJobId = localStorage.getItem('selectedJobId') ? parseInt(localStorage.getItem('selectedJobId'), 10) : null;
 let selectedAppName = null; // derived from jobsList when selection changes
+let urlFinderProvider = localStorage.getItem('urlFinderProvider') || null;
 
 function getScopeQuery() {
     if (selectedJobId != null && !isNaN(selectedJobId)) return '?job_id=' + selectedJobId;
@@ -34,8 +35,70 @@ function updateSelectedAppName() {
     selectedAppName = job ? job.app_name : null;
 }
 
+async function loadUrlFinderConfig() {
+    try {
+        const res = await fetch('/api/url-finder/config');
+        if (!res.ok) return;
+        const cfg = await res.json();
+        if (!urlFinderProvider) {
+            urlFinderProvider = cfg.default_provider || 'cse';
+            localStorage.setItem('urlFinderProvider', urlFinderProvider);
+        }
+        updateUrlFinderProviderSelector(cfg);
+    } catch (e) {
+        console.error('Error loading URL finder config:', e);
+        if (!urlFinderProvider) {
+            urlFinderProvider = 'cse';
+            localStorage.setItem('urlFinderProvider', urlFinderProvider);
+        }
+        updateUrlFinderProviderSelector();
+    }
+}
+
+function updateUrlFinderProviderSelector(cfg) {
+    const providerSelect = document.getElementById('url-finder-provider');
+    if (!providerSelect) return;
+    const isCseConfigured = cfg ? cfg.cse_configured !== false : undefined;
+    const isPerplexityConfigured = cfg ? cfg.perplexity_configured !== false : undefined;
+    const isGeminiConfigured = cfg ? cfg.gemini_configured !== false : undefined;
+
+    // Disable unavailable options (visual hint)
+    const cseOpt = providerSelect.querySelector('option[value="cse"]');
+    const pplxOpt = providerSelect.querySelector('option[value="perplexity"]');
+    const geminiOpt = providerSelect.querySelector('option[value="gemini"]');
+    if (cseOpt) cseOpt.disabled = isCseConfigured === false;
+    if (pplxOpt) pplxOpt.disabled = isPerplexityConfigured === false;
+    if (geminiOpt) geminiOpt.disabled = isGeminiConfigured === false;
+
+    // If current provider isn't available, fall back
+    if (urlFinderProvider === 'perplexity' && isPerplexityConfigured === false) {
+        urlFinderProvider = isCseConfigured === false ? 'extension' : 'cse';
+        localStorage.setItem('urlFinderProvider', urlFinderProvider);
+    }
+    if (urlFinderProvider === 'gemini' && isGeminiConfigured === false) {
+        // Prefer cse if available, else perplexity, else extension
+        urlFinderProvider = isCseConfigured === false ? (isPerplexityConfigured === false ? 'extension' : 'perplexity') : 'cse';
+        localStorage.setItem('urlFinderProvider', urlFinderProvider);
+    }
+    if (urlFinderProvider === 'cse' && isCseConfigured === false) {
+        urlFinderProvider = isPerplexityConfigured === false
+            ? (isGeminiConfigured === false ? 'extension' : 'gemini')
+            : 'perplexity';
+        localStorage.setItem('urlFinderProvider', urlFinderProvider);
+    }
+    providerSelect.value = urlFinderProvider || 'cse';
+}
+
+function getProviderLabel(provider) {
+    if (provider === 'cse') return 'Google CSE';
+    if (provider === 'perplexity') return 'Perplexity';
+    if (provider === 'gemini') return 'Gemini';
+    return 'Chrome Extension';
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
     initializeEventListeners();
+    await loadUrlFinderConfig();
     await loadJobsAndAppFilter();
     startPolling();
     initializePage();
@@ -200,12 +263,20 @@ function initializeEventListeners() {
     
     const startUrlFindingBtn = document.getElementById('start-url-finding');
     const stopUrlFindingBtn = document.getElementById('stop-url-finding');
+    const providerSelect = document.getElementById('url-finder-provider');
     
     if (startUrlFindingBtn) {
         startUrlFindingBtn.addEventListener('click', startUrlFinding);
     }
     if (stopUrlFindingBtn) {
         stopUrlFindingBtn.addEventListener('click', stopUrlFinding);
+    }
+    if (providerSelect) {
+        providerSelect.addEventListener('change', () => {
+            urlFinderProvider = providerSelect.value;
+            localStorage.setItem('urlFinderProvider', urlFinderProvider);
+            showStatus(`URL source set to ${getProviderLabel(urlFinderProvider)}.`, 'info');
+        });
     }
     
     // Email scraping button
@@ -1483,7 +1554,7 @@ async function findStoreUrl(storeId, storeName, country) {
     }
     
     modalTitle.textContent = `Find URL for ${storeName}`;
-    modalBody.innerHTML = '<div class="loading">Requesting search from Chrome extension...</div>';
+    modalBody.innerHTML = '<div class="loading">Preparing search...</div>';
     modal.style.display = 'block';
     
     // Clean store name
@@ -1494,6 +1565,213 @@ async function findStoreUrl(storeId, storeName, country) {
     cleanName = cleanName.replace(/\s+\d{1,2}\/\d{1,2}\/\d{4}/g, '');
     cleanName = cleanName.split(/\s+/).filter(w => w).join(' ').trim();
     
+    // Provider: Perplexity (ranked URLs + confidence; autosave if high confidence)
+    if (urlFinderProvider === 'perplexity') {
+        try {
+            modalBody.innerHTML = '<div class="loading">Searching via Perplexity...</div>';
+
+            // Gather additional context (optional)
+            let reviewText = '';
+            if (currentStore && currentStore.id === storeId) {
+                reviewText = currentStore.review_text || '';
+            } else {
+                try {
+                    const storeResponse = await fetch(`/api/stores/${storeId}`);
+                    if (storeResponse.ok) {
+                        const storeData = await storeResponse.json();
+                        reviewText = storeData.review_text || '';
+                    }
+                } catch (e) {
+                    // ignore
+                }
+            }
+
+            const response = await fetch('/api/search/perplexity', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    store_name: cleanName,
+                    country: country || '',
+                    review_text: reviewText || ''
+                })
+            });
+
+            const data = await response.json();
+            if (!response.ok) {
+                const errorMessage = data.error || 'Perplexity request failed.';
+                modalBody.innerHTML = `
+                    <div class="manual-url-entry">
+                        <p><strong>Perplexity search failed.</strong> ${errorMessage}</p>
+                        <p style="margin-top: 10px;">You can switch providers or enter the URL manually:</p>
+                        <div class="input-group" style="margin-top: 10px;">
+                            <input type="text" id="manual-url-input" placeholder="Paste store URL here" style="width: 100%; padding: 10px;">
+                        </div>
+                        <button class="btn-small" onclick="confirmManualUrl(${storeId})" style="margin-top: 10px; width: 100%;">Confirm URL</button>
+                    </div>
+                `;
+                isFindingUrl = false;
+                return;
+            }
+
+            const selectedUrl = data.selected_url;
+            const confidence = typeof data.confidence === 'number' ? data.confidence : null;
+            const threshold = typeof data.autosave_threshold === 'number' ? data.autosave_threshold : 0.7;
+
+            if (selectedUrl && confidence != null && confidence >= threshold) {
+                showStatus(`Perplexity auto-selected URL with ${Math.round(confidence * 100)}% confidence. Processing...`, 'success');
+                closeModal();
+                isFindingUrl = false;
+                await new Promise(resolve => setTimeout(resolve, 200));
+                await selectExtractedUrl(storeId, selectedUrl);
+                return;
+            }
+
+            // Low/unknown confidence: show ranked modal for manual selection (no AI selector)
+            await displayRankedUrlsWithoutAI({
+                urls: data.results || [],
+                recommendedIndex: 0,
+                recommendedUrl: selectedUrl || null,
+                confidence: confidence,
+                reasoning: data.reasoning || '',
+                providerLabel: 'Perplexity',
+                threshold: threshold
+            }, storeId, storeName);
+            isFindingUrl = false;
+            return;
+        } catch (error) {
+            console.error('Perplexity search error:', error);
+            modalBody.innerHTML = `<p class="error">Perplexity search error: ${error.message}</p>`;
+            isFindingUrl = false;
+            return;
+        }
+    }
+
+    // Provider: Gemini (Google Search tool) (ranked URLs + confidence; autosave if high confidence)
+    if (urlFinderProvider === 'gemini') {
+        try {
+            modalBody.innerHTML = '<div class="loading">Searching via Gemini...</div>';
+
+            // Gather additional context (optional)
+            let reviewText = '';
+            if (currentStore && currentStore.id === storeId) {
+                reviewText = currentStore.review_text || '';
+            } else {
+                try {
+                    const storeResponse = await fetch(`/api/stores/${storeId}`);
+                    if (storeResponse.ok) {
+                        const storeData = await storeResponse.json();
+                        reviewText = storeData.review_text || '';
+                    }
+                } catch (e) {
+                    // ignore
+                }
+            }
+
+            const response = await fetch('/api/search/gemini', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    store_name: cleanName,
+                    country: country || '',
+                    review_text: reviewText || ''
+                })
+            });
+
+            const data = await response.json();
+            if (!response.ok) {
+                const errorMessage = data.error || 'Gemini request failed.';
+                const suggestion = data.suggestion || 'You can switch providers or enter the URL manually.';
+                const isRateLimit = response.status === 429 || data.error_type === 'rate_limit' || data.error_type === 'rate_limit_exhausted';
+                
+                modalBody.innerHTML = `
+                    <div class="manual-url-entry">
+                        <p><strong>Gemini search failed.</strong> ${errorMessage}</p>
+                        ${isRateLimit ? '<p style="margin-top: 10px; color: #856404; background: #fff3cd; padding: 10px; border-radius: 4px; border-left: 4px solid #ffc107;"><strong>Rate limit exceeded:</strong> Gemini API is temporarily unavailable. The system will retry automatically, but you may want to switch to another provider (Google CSE, Perplexity, or Chrome Extension) for now.</p>' : ''}
+                        <p style="margin-top: 10px;">${suggestion}</p>
+                        <div class="input-group" style="margin-top: 10px;">
+                            <input type="text" id="manual-url-input" placeholder="Paste store URL here" style="width: 100%; padding: 10px;">
+                        </div>
+                        <button class="btn-small" onclick="confirmManualUrl(${storeId})" style="margin-top: 10px; width: 100%;">Confirm URL</button>
+                    </div>
+                `;
+                isFindingUrl = false;
+                return;
+            }
+
+            const selectedUrl = data.selected_url;
+            const confidence = typeof data.confidence === 'number' ? data.confidence : null;
+            const threshold = typeof data.autosave_threshold === 'number' ? data.autosave_threshold : 0.7;
+
+            if (selectedUrl && confidence != null && confidence >= threshold) {
+                showStatus(`Gemini auto-selected URL with ${Math.round(confidence * 100)}% confidence. Processing...`, 'success');
+                closeModal();
+                isFindingUrl = false;
+                await new Promise(resolve => setTimeout(resolve, 200));
+                await selectExtractedUrl(storeId, selectedUrl);
+                return;
+            }
+
+            // Low/unknown confidence: show ranked modal for manual selection (no AI selector)
+            await displayRankedUrlsWithoutAI({
+                urls: data.results || [],
+                recommendedIndex: 0,
+                recommendedUrl: selectedUrl || null,
+                confidence: confidence,
+                reasoning: data.reasoning || '',
+                providerLabel: 'Gemini',
+                threshold: threshold
+            }, storeId, storeName);
+            isFindingUrl = false;
+            return;
+        } catch (error) {
+            console.error('Gemini search error:', error);
+            modalBody.innerHTML = `<p class="error">Gemini search error: ${error.message}</p>`;
+            isFindingUrl = false;
+            return;
+        }
+    }
+
+    // Primary path: Google CSE
+    if (urlFinderProvider === 'cse') {
+        try {
+            modalBody.innerHTML = '<div class="loading">Searching via Google CSE...</div>';
+            const response = await fetch('/api/search/cse', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    store_name: cleanName,
+                    country: country || ''
+                })
+            });
+
+            const data = await response.json();
+            if (response.ok && data.results && data.results.length > 0) {
+                await displayExtractedUrls(data.results, storeId, storeName);
+                isFindingUrl = false;
+                return;
+            }
+
+            const errorMessage = data.error || 'No results returned from CSE.';
+            modalBody.innerHTML = `
+                <div class="manual-url-entry">
+                    <p><strong>CSE search failed.</strong> ${errorMessage}</p>
+                    <p style="margin-top: 10px;">You can switch to Chrome Extension or enter the URL manually:</p>
+                    <div class="input-group" style="margin-top: 10px;">
+                        <input type="text" id="manual-url-input" placeholder="Paste store URL here" style="width: 100%; padding: 10px;">
+                    </div>
+                    <button class="btn-small" onclick="confirmManualUrl(${storeId})" style="margin-top: 10px; width: 100%;">Confirm URL</button>
+                </div>
+            `;
+            isFindingUrl = false;
+            return;
+        } catch (error) {
+            console.error('CSE search error:', error);
+            modalBody.innerHTML = `<p class="error">CSE search error: ${error.message}</p>`;
+            isFindingUrl = false;
+            return;
+        }
+    }
+
     // Try direct extension communication first (if extension is installed)
     if (window.extensionSearch) {
         try {
@@ -1836,6 +2114,100 @@ async function displayExtractedUrls(urls, storeId, storeName) {
     urlsHtml += '</div>';
     urlsHtml += '</div>';
     
+    modalBody.innerHTML = urlsHtml;
+}
+
+async function displayRankedUrlsWithoutAI(meta, storeId, storeName) {
+    const modalBody = document.getElementById('modal-body');
+    const urls = Array.isArray(meta && meta.urls) ? meta.urls : [];
+    const recommendedUrl = meta ? meta.recommendedUrl : null;
+    const confidence = meta && typeof meta.confidence === 'number' ? meta.confidence : null;
+    const reasoning = meta && meta.reasoning ? String(meta.reasoning) : '';
+    const providerLabel = meta && meta.providerLabel ? String(meta.providerLabel) : 'Provider';
+    const threshold = meta && typeof meta.threshold === 'number' ? meta.threshold : 0.7;
+
+    if (!urls.length) {
+        modalBody.innerHTML = `
+            <div class="manual-url-entry">
+                <p><strong>No URLs returned from ${providerLabel}.</strong></p>
+                <p style="margin-top: 10px;">You can enter the URL manually:</p>
+                <div class="input-group" style="margin-top: 10px;">
+                    <input type="text" id="manual-url-input" placeholder="Paste store URL here" style="width: 100%; padding: 10px;">
+                </div>
+                <button class="btn-small" onclick="confirmManualUrl(${storeId})" style="margin-top: 10px; width: 100%;">Confirm URL</button>
+            </div>
+        `;
+        return;
+    }
+
+    let urlsHtml = '<div class="extracted-urls">';
+    urlsHtml += `<p><strong>${providerLabel} ranked ${urls.length} URLs. Select the correct store URL:</strong></p>`;
+
+    if (recommendedUrl) {
+        const confText = confidence != null ? `${Math.round(confidence * 100)}%` : 'N/A';
+        const note = confidence != null && confidence < threshold
+            ? `<br><small style="color: #666; font-style: italic;">(Auto-save threshold is ${Math.round(threshold * 100)}% — manual selection required)</small>`
+            : '';
+        urlsHtml += `<div style="background: #f5f7ff; border-left: 4px solid #5b6cff; padding: 10px; margin-bottom: 15px; border-radius: 4px;">
+            <p style="margin: 0; font-size: 13px; color: #2c3e50;">
+                <strong>⭐ Recommendation:</strong> ${recommendedUrl}<br>
+                <small style="color: #666;">Confidence: ${confText}${reasoning ? `<br>${reasoning}` : ''}</small>
+                ${note}
+            </p>
+        </div>`;
+    }
+
+    urlsHtml += '<div class="url-buttons-container" style="max-height: 400px; overflow-y: auto; margin-top: 15px;">';
+
+    urls.forEach((urlData, index) => {
+        const url = typeof urlData === 'string' ? urlData : (urlData.url || '');
+        if (!url) return;
+        let domain = url;
+        try {
+            const urlObj = new URL(url);
+            domain = urlObj.hostname.replace('www.', '');
+        } catch (e) {
+            // ignore
+        }
+
+        const itemConfidence = (urlData && typeof urlData.confidence === 'number') ? urlData.confidence : null;
+        const confBadge = itemConfidence != null
+            ? `<span style="background:#eef; color:#334; padding:2px 6px; border-radius: 10px; font-size: 11px; margin-left: 8px;">${Math.round(itemConfidence * 100)}%</span>`
+            : '';
+
+        const escapedUrl = String(url)
+            .replace(/\\/g, '\\\\')
+            .replace(/'/g, "\\'")
+            .replace(/"/g, '&quot;')
+            .replace(/\n/g, '\\n')
+            .replace(/\r/g, '\\r');
+
+        const isRecommended = recommendedUrl && url === recommendedUrl;
+        const border = isRecommended ? '2px solid #5b6cff' : '1px solid #ddd';
+        const bg = isRecommended ? '#f5f7ff' : '#fff';
+
+        urlsHtml += `
+            <button class="url-button" onclick="selectExtractedUrl(${storeId}, '${escapedUrl}')" style="display:block; width: 100%; text-align:left; margin-bottom: 8px; padding: 10px; border: ${border}; border-radius: 6px; background: ${bg}; cursor: pointer;">
+                <div style="font-size: 13px; font-weight: 600; color:#2c3e50;">
+                    #${index + 1} ${domain}${confBadge}
+                </div>
+                <div style="font-size: 12px; color:#0066cc; word-break: break-all; margin-top: 4px;">${url}</div>
+                ${urlData && urlData.title ? `<div style="font-size: 12px; color:#444; margin-top: 4px;">${urlData.title}</div>` : ''}
+                ${urlData && urlData.snippet ? `<div style="font-size: 11px; color:#777; margin-top: 4px;">${urlData.snippet}</div>` : ''}
+            </button>
+        `;
+    });
+
+    urlsHtml += '</div>';
+    urlsHtml += '<div style="margin-top: 16px; padding-top: 12px; border-top: 1px solid #ddd;">';
+    urlsHtml += '<p style="font-size: 12px; color: #666; margin-bottom: 10px;">Or enter URL manually:</p>';
+    urlsHtml += '<div class="input-group">';
+    urlsHtml += '<input type="text" id="manual-url-input" placeholder="Paste store URL here" style="width: 100%; padding: 10px; font-size: 14px;">';
+    urlsHtml += '</div>';
+    urlsHtml += `<button class="btn-small" onclick="confirmManualUrl(${storeId})" style="margin-top: 10px; width: 100%;">Confirm Manual URL</button>`;
+    urlsHtml += '</div>';
+    urlsHtml += '</div>';
+
     modalBody.innerHTML = urlsHtml;
 }
 
