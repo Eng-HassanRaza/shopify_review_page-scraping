@@ -7,7 +7,7 @@ import asyncio
 import json
 import time
 import psycopg2.extras
-from config import HOST, PORT, DEBUG, DATABASE_URL, EMAIL_SCRAPER_MAX_PAGES, EMAIL_SCRAPER_DELAY, EMAIL_SCRAPER_TIMEOUT, EMAIL_SCRAPER_MAX_RETRIES, EMAIL_SCRAPER_SITEMAP_LIMIT, MAX_CONCURRENT_EMAIL_SCRAPING
+from config import HOST, PORT, DEBUG, DATABASE_URL, EMAIL_SCRAPER_MAX_PAGES, EMAIL_SCRAPER_DELAY, EMAIL_SCRAPER_TIMEOUT, EMAIL_SCRAPER_MAX_RETRIES, EMAIL_SCRAPER_SITEMAP_LIMIT, MAX_CONCURRENT_EMAIL_SCRAPING, EMAIL_SCRAPING_DNS_ERROR_THRESHOLD, EMAIL_SCRAPING_FAILED_COOLDOWN_MINUTES, EMAIL_SCRAPING_MAX_RETRIES as EMAIL_SCRAPING_MAX_RETRIES_CONFIG
 from database import Database
 from modules.email_scraper import EmailScraper
 from modules.ai_email_extractor import AIEmailExtractor
@@ -81,12 +81,28 @@ def start_next_email_scraping_job(app_name=None):
         active_store_ids_set = set(active_email_scraping_jobs)
     
     # Get multiple pending stores and filter out already active ones (optionally for one app)
-    pending_stores = db.get_stores_with_urls_no_emails(limit=MAX_CONCURRENT_EMAIL_SCRAPING * 2, app_name=app_name)
-    if not pending_stores:
+    # Excludes failed stores within cooldown period
+    pending_stores = db.get_stores_with_urls_no_emails(
+        limit=MAX_CONCURRENT_EMAIL_SCRAPING * 2,
+        app_name=app_name,
+        cooldown_minutes=EMAIL_SCRAPING_FAILED_COOLDOWN_MINUTES
+    )
+    
+    # Also check for failed stores ready for retry
+    failed_stores = db.get_failed_stores_for_retry(
+        cooldown_minutes=EMAIL_SCRAPING_FAILED_COOLDOWN_MINUTES,
+        limit=5,
+        app_name=app_name
+    )
+    
+    # Combine lists (prioritize new stores over retries)
+    all_stores = pending_stores + failed_stores
+    
+    if not all_stores:
         return None  # No more stores to process
     
     # Filter out stores that are already active
-    available_stores = [s for s in pending_stores if s['id'] not in active_store_ids_set]
+    available_stores = [s for s in all_stores if s['id'] not in active_store_ids_set]
     if not available_stores:
         return None  # All pending stores are already active
     
@@ -128,13 +144,40 @@ def start_next_email_scraping_job(app_name=None):
                 pages_scraped = scraping_stats.get('pages_scraped', 0)
                 pages_failed = scraping_stats.get('pages_failed', 0)
                 pages_with_emails = scraping_stats.get('pages_with_emails', 0)
+                dns_errors = scraping_stats.get('dns_errors', 0)
+                connection_errors = scraping_stats.get('connection_errors', 0)
+                timeout_errors = scraping_stats.get('timeout_errors', 0)
                 
                 logger.info(f"Email scraping completed for store {store_id} ({store_name}): "
                           f"Raw emails: {len(raw_emails)}, "
-                          f"Pages: {pages_discovered} discovered, {pages_scraped} scraped, {pages_failed} failed, {pages_with_emails} with emails")
+                          f"Pages: {pages_discovered} discovered, {pages_scraped} scraped, {pages_failed} failed, {pages_with_emails} with emails, "
+                          f"Errors: DNS={dns_errors}, Connection={connection_errors}, Timeout={timeout_errors}")
                 
-                # Warn if scraping seems to have failed
-                if len(raw_emails) == 0:
+                # Check for DNS/connection errors - mark as failed if threshold exceeded
+                total_dns_connection_errors = dns_errors + connection_errors
+                if total_dns_connection_errors >= EMAIL_SCRAPING_DNS_ERROR_THRESHOLD:
+                    # Increment retry attempts
+                    db.increment_email_scraping_attempts(store_id)
+                    
+                    # Get current attempt count
+                    store_data = db.get_store(store_id)
+                    attempts = store_data.get('email_scraping_attempts', 0) if store_data else 0
+                    
+                    if attempts >= EMAIL_SCRAPING_MAX_RETRIES_CONFIG:
+                        # Max retries reached - mark as permanent failure
+                        error_msg = f"DNS/connection errors exceeded threshold ({total_dns_connection_errors} errors, {attempts} attempts). DNS={dns_errors}, Connection={connection_errors}"
+                        db.mark_email_scraping_permanent_failure(store_id, error_msg)
+                        logger.error(f"Store {store_id} ({store_name}): Marked as permanent failure after {attempts} retry attempts")
+                        scraping_error = error_msg
+                    else:
+                        # Mark as failed, will retry later after cooldown
+                        error_msg = f"DNS/connection errors exceeded threshold ({total_dns_connection_errors} errors). DNS={dns_errors}, Connection={connection_errors}"
+                        db.mark_email_scraping_failed(store_id, 'dns' if dns_errors > connection_errors else 'connection', error_msg)
+                        logger.warning(f"Store {store_id} ({store_name}): Marked as failed (attempt {attempts + 1}/{EMAIL_SCRAPING_MAX_RETRIES_CONFIG}). Will retry after cooldown.")
+                        scraping_error = error_msg
+                
+                # Warn if scraping seems to have failed (but not DNS/connection errors which are handled above)
+                elif len(raw_emails) == 0:
                     if pages_discovered == 0:
                         logger.warning(f"Store {store_id} ({store_name}): No pages discovered - possible URL issue or site blocking")
                         scraping_error = "No pages discovered"
@@ -230,8 +273,13 @@ def start_batch_email_scraping():
         active_store_ids_set = set(active_email_scraping_jobs)
     
     # Get pending stores - get enough for all available slots (optionally for one app)
+    # Excludes failed stores within cooldown period
     jobs_to_start = min(MAX_CONCURRENT_EMAIL_SCRAPING - active_count, MAX_CONCURRENT_EMAIL_SCRAPING)
-    pending_stores = db.get_stores_with_urls_no_emails(limit=jobs_to_start * 2, app_name=app_name)
+    pending_stores = db.get_stores_with_urls_no_emails(
+        limit=jobs_to_start * 2,
+        app_name=app_name,
+        cooldown_minutes=EMAIL_SCRAPING_FAILED_COOLDOWN_MINUTES
+    )
     
     # Filter out stores that are already active
     truly_pending = [s for s in pending_stores if s['id'] not in active_store_ids_set]
@@ -289,12 +337,40 @@ def start_batch_email_scraping():
                     pages_scraped = scraping_stats.get('pages_scraped', 0)
                     pages_failed = scraping_stats.get('pages_failed', 0)
                     pages_with_emails = scraping_stats.get('pages_with_emails', 0)
+                    dns_errors = scraping_stats.get('dns_errors', 0)
+                    connection_errors = scraping_stats.get('connection_errors', 0)
+                    timeout_errors = scraping_stats.get('timeout_errors', 0)
                     
                     logger.info(f"Email scraping completed for store {store_id} ({store_name}): "
                               f"Raw emails: {len(raw_emails)}, "
-                              f"Pages: {pages_discovered} discovered, {pages_scraped} scraped, {pages_failed} failed, {pages_with_emails} with emails")
+                              f"Pages: {pages_discovered} discovered, {pages_scraped} scraped, {pages_failed} failed, {pages_with_emails} with emails, "
+                              f"Errors: DNS={dns_errors}, Connection={connection_errors}, Timeout={timeout_errors}")
                     
-                    if len(raw_emails) == 0:
+                    # Check for DNS/connection errors - mark as failed if threshold exceeded
+                    total_dns_connection_errors = dns_errors + connection_errors
+                    if total_dns_connection_errors >= EMAIL_SCRAPING_DNS_ERROR_THRESHOLD:
+                        # Increment retry attempts
+                        db.increment_email_scraping_attempts(store_id)
+                        
+                        # Get current attempt count
+                        store_data = db.get_store(store_id)
+                        attempts = store_data.get('email_scraping_attempts', 0) if store_data else 0
+                        
+                        if attempts >= EMAIL_SCRAPING_MAX_RETRIES_CONFIG:
+                            # Max retries reached - mark as permanent failure
+                            error_msg = f"DNS/connection errors exceeded threshold ({total_dns_connection_errors} errors, {attempts} attempts). DNS={dns_errors}, Connection={connection_errors}"
+                            db.mark_email_scraping_permanent_failure(store_id, error_msg)
+                            logger.error(f"Store {store_id} ({store_name}): Marked as permanent failure after {attempts} retry attempts")
+                            scraping_error = error_msg
+                        else:
+                            # Mark as failed, will retry later after cooldown
+                            error_msg = f"DNS/connection errors exceeded threshold ({total_dns_connection_errors} errors). DNS={dns_errors}, Connection={connection_errors}"
+                            db.mark_email_scraping_failed(store_id, 'dns' if dns_errors > connection_errors else 'connection', error_msg)
+                            logger.warning(f"Store {store_id} ({store_name}): Marked as failed (attempt {attempts + 1}/{EMAIL_SCRAPING_MAX_RETRIES_CONFIG}). Will retry after cooldown.")
+                            scraping_error = error_msg
+                    
+                    # Warn if scraping seems to have failed (but not DNS/connection errors which are handled above)
+                    elif len(raw_emails) == 0:
                         if pages_discovered == 0:
                             logger.warning(f"Store {store_id} ({store_name}): No pages discovered - possible URL issue or site blocking")
                             scraping_error = "No pages discovered"
@@ -375,7 +451,11 @@ def get_batch_email_scraping_status():
         active_store_ids = list(active_email_scraping_jobs)
     
     # Get stores with URLs but no emails (pending), optionally for one app
-    pending_stores = db.get_stores_with_urls_no_emails(app_name=app_name)
+    # Excludes failed stores within cooldown period
+    pending_stores = db.get_stores_with_urls_no_emails(
+        app_name=app_name,
+        cooldown_minutes=EMAIL_SCRAPING_FAILED_COOLDOWN_MINUTES
+    )
     pending_count = len(pending_stores)
     
     # Get active store details (optionally filter by app_name for scoped view)

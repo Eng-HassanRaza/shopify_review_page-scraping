@@ -141,8 +141,15 @@ class EmailScraper:
         if self.current_delay > self.base_delay:
             self.current_delay = max(self.base_delay, self.current_delay * 0.9)
     
-    async def get_page(self, session: aiohttp.ClientSession, url: str) -> Tuple[Optional[str], str]:
-        """Fetch page with retry logic and proper 429 handling"""
+    async def get_page(self, session: aiohttp.ClientSession, url: str) -> Tuple[Optional[str], str, Optional[str]]:
+        """Fetch page with retry logic and proper 429 handling.
+        
+        Returns:
+            Tuple of (content, final_url, error_type)
+            - content: Page content if successful, None if failed
+            - final_url: Final URL after redirects
+            - error_type: None if success, 'dns', 'timeout', 'connection', 'http_error' if failed
+        """
         # Check circuit breaker
         if self.circuit_open:
             logger.warning(f"Circuit breaker is OPEN. Waiting {self.current_delay}s before attempting {url}")
@@ -158,7 +165,7 @@ class EmailScraper:
                         logger.debug(f"Page not found (404): {url}")
                         # 404 is a valid response, reset rate limiting
                         self._reset_rate_limit_tracking()
-                        return None, url
+                        return None, url, 'http_error'
                     
                     # Special handling for 429 (Too Many Requests)
                     if response.status == 429:
@@ -183,7 +190,7 @@ class EmailScraper:
                         # If circuit is open, don't retry immediately
                         if self.circuit_open:
                             logger.error(f"Circuit breaker OPEN. Stopping requests to {url} after {self.max_retries} attempts")
-                            return None, url
+                            return None, url, 'http_error'
                         
                         # Wait before retrying (use the wait_time from rate limit handler)
                         logger.warning(f"429 Too Many Requests for {url}, waiting {wait_time:.2f}s (attempt {attempt + 1}/{self.max_retries})")
@@ -200,7 +207,7 @@ class EmailScraper:
                         else:
                             logger.error(f"HTTP {response.status} for {url} after {self.max_retries} attempts")
                             # Don't reset rate limiting on errors (might still be rate limited)
-                            return None, url
+                            return None, url, 'http_error'
                     
                     # Success! Reset rate limit tracking on successful 2xx response
                     if 200 <= response.status < 300:
@@ -213,28 +220,28 @@ class EmailScraper:
                         text = await response.text(encoding=charset, errors='replace')
                         final_url = str(response.url)
                         logger.debug(f"Successfully fetched {url} ({len(text)} bytes)")
-                        return text, final_url
+                        return text, final_url, None
                     except UnicodeDecodeError as e:
                         logger.warning(f"Unicode decode error for {url}: {e}, trying with utf-8")
                         try:
                             text = await response.read()
                             text = text.decode('utf-8', errors='replace')
                             final_url = str(response.url)
-                            return text, final_url
+                            return text, final_url, None
                         except Exception as e2:
                             logger.warning(f"Error reading response after decode retry for {url}: {e2}")
                             if attempt < self.max_retries - 1:
                                 wait_time = 2 ** attempt
                                 await asyncio.sleep(wait_time)
                                 continue
-                            return None, url
+                            return None, url, 'connection'
                     except Exception as e:
                         logger.warning(f"Error reading response text for {url}: {type(e).__name__} - {str(e)}")
                         if attempt < self.max_retries - 1:
                             wait_time = 2 ** attempt
                             await asyncio.sleep(wait_time)
                             continue
-                        return None, url
+                        return None, url, 'connection'
                     
                     # If we got here, response was successfully read (2xx status)
                     # Rate limiting already reset above
@@ -246,7 +253,18 @@ class EmailScraper:
                     await asyncio.sleep(wait_time)
                 else:
                     logger.error(f"Timeout for {url} after {self.max_retries} attempts: {type(e).__name__}")
-                    return None, url
+                    return None, url, 'timeout'
+                    
+            except aiohttp.ClientConnectorError as e:
+                # DNS resolution errors and connection errors
+                error_type = 'dns' if 'name resolution' in str(e).lower() or 'cannot connect' in str(e).lower() else 'connection'
+                if attempt < self.max_retries - 1:
+                    wait_time = 2 ** attempt
+                    logger.warning(f"Client error for {url}: {type(e).__name__} - {str(e)}, retrying in {wait_time}s (attempt {attempt + 1}/{self.max_retries})")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"Client error for {url} after {self.max_retries} attempts: {type(e).__name__} - {str(e)}")
+                    return None, url, error_type
                     
             except aiohttp.ClientError as e:
                 if attempt < self.max_retries - 1:
@@ -255,7 +273,7 @@ class EmailScraper:
                     await asyncio.sleep(wait_time)
                 else:
                     logger.error(f"Client error for {url} after {self.max_retries} attempts: {type(e).__name__} - {str(e)}")
-                    return None, url
+                    return None, url, 'connection'
                     
             except Exception as e:
                 if attempt < self.max_retries - 1:
@@ -264,10 +282,10 @@ class EmailScraper:
                     await asyncio.sleep(wait_time)
                 else:
                     logger.error(f"Unexpected error fetching {url} after {self.max_retries} attempts: {type(e).__name__} - {str(e)}")
-                    return None, url
+                    return None, url, 'connection'
         
         logger.error(f"Failed to fetch {url} after {self.max_retries} attempts - no specific error captured")
-        return None, url
+        return None, url, 'connection'
     
     def extract_emails_from_text(self, text: str) -> Set[str]:
         """Extract emails from plain text with enhanced obfuscation handling"""
@@ -484,7 +502,7 @@ class EmailScraper:
     
     async def expand_from_sitemap(self, session: aiohttp.ClientSession, sitemap_url: str) -> List[str]:
         """Extract additional pages from sitemap with improved logic"""
-        html_text, final_url = await self.get_page(session, sitemap_url)
+        html_text, final_url, error_type = await self.get_page(session, sitemap_url)
         if not html_text:
             return []
         
@@ -542,7 +560,7 @@ class EmailScraper:
                 page_queue.append((page, priority))
         
         # Get footer links from homepage
-        homepage_text, _ = await self.get_page(session, store_url)
+        homepage_text, _, homepage_error = await self.get_page(session, store_url)
         if homepage_text:
             soup = BeautifulSoup(homepage_text, "html.parser")
             footer_links = self.extract_footer_links(soup, store_url)
@@ -555,7 +573,7 @@ class EmailScraper:
         # Follow links from high-value pages (1 level deep)
         high_value_pages = [url for url, pri in page_queue if pri == 1][:5]  # Limit to first 5
         for page_url in high_value_pages:
-            page_text, _ = await self.get_page(session, page_url)
+            page_text, _, page_error = await self.get_page(session, page_url)
             if page_text:
                 soup = BeautifulSoup(page_text, "html.parser")
                 keywords = ['contact', 'email', 'support', 'help', 'team', 'about']
@@ -572,21 +590,21 @@ class EmailScraper:
         # Limit to max_pages
         return page_queue[:self.max_pages]
     
-    async def scrape_page(self, session: aiohttp.ClientSession, page_url: str) -> Tuple[Set[str], bool]:
-        """Scrape a single page and return emails and success status"""
+    async def scrape_page(self, session: aiohttp.ClientSession, page_url: str) -> Tuple[Set[str], bool, Optional[str]]:
+        """Scrape a single page and return emails, success status, and error type"""
         try:
-            html_text, final_url = await self.get_page(session, page_url)
+            html_text, final_url, error_type = await self.get_page(session, page_url)
             if not html_text:
-                logger.warning(f"No HTML content returned for {page_url} - check get_page error logs above")
-                return set(), False
+                logger.warning(f"No HTML content returned for {page_url} - error_type: {error_type}")
+                return set(), False, error_type
             
             page_emails = self.extract_emails_from_page(html_text, final_url)
             if page_emails:
                 logger.debug(f"Scraped {page_url}: found {len(page_emails)} emails")
-            return page_emails, True
+            return page_emails, True, None
         except Exception as e:
             logger.error(f"Exception in scrape_page for {page_url}: {type(e).__name__} - {str(e)}", exc_info=True)
-            return set(), False
+            return set(), False, 'connection'
     
     async def scrape_emails(
         self, 
@@ -615,7 +633,11 @@ class EmailScraper:
             'pages_discovered': 0,
             'pages_scraped': 0,
             'pages_failed': 0,
-            'pages_with_emails': 0
+            'pages_with_emails': 0,
+            'dns_errors': 0,
+            'connection_errors': 0,
+            'timeout_errors': 0,
+            'http_errors': 0
         }
         
         # Create session with timeout configuration
@@ -665,18 +687,26 @@ class EmailScraper:
                     
                     logger.info(f"Checking page {i+1}/{len(page_queue)} [{priority_label} priority]: {page_url} (current delay: {self.current_delay:.2f}s)")
                     
-                    page_emails, success = await self.scrape_page(session, page_url)
+                    page_emails, success, error_type = await self.scrape_page(session, page_url)
                     
                     if success:
                         stats['pages_scraped'] += 1
                         if page_emails:
                             stats['pages_with_emails'] += 1
                             logger.info(f"Found {len(page_emails)} emails: {', '.join(page_emails)}")
+                        all_emails.update(page_emails)
                     else:
                         stats['pages_failed'] += 1
-                        logger.warning(f"Failed to scrape page: {page_url}")
-                    
-                    all_emails.update(page_emails)
+                        # Track error types
+                        if error_type == 'dns':
+                            stats['dns_errors'] += 1
+                        elif error_type == 'timeout':
+                            stats['timeout_errors'] += 1
+                        elif error_type == 'connection':
+                            stats['connection_errors'] += 1
+                        elif error_type == 'http_error':
+                            stats['http_errors'] += 1
+                        logger.warning(f"Failed to scrape page: {page_url} (error_type: {error_type})")
                     
                     # Use adaptive delay (increases if rate limited, decreases on success)
                     # Only wait if not the last page
@@ -714,6 +744,10 @@ class EmailScraper:
                     'pages_discovered': stats['pages_discovered'],
                     'pages_scraped': stats['pages_scraped'],
                     'pages_failed': stats['pages_failed'],
-                    'pages_with_emails': stats['pages_with_emails']
+                    'pages_with_emails': stats['pages_with_emails'],
+                    'dns_errors': stats.get('dns_errors', 0),
+                    'connection_errors': stats.get('connection_errors', 0),
+                    'timeout_errors': stats.get('timeout_errors', 0),
+                    'http_errors': stats.get('http_errors', 0)
                 }
             }

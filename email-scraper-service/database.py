@@ -98,6 +98,23 @@ class Database:
             conn.commit()
             logger.info("Limit columns added")
         
+        # Helper function to check if column exists
+        def column_exists(table_name, column_name):
+            cursor.execute("""
+                SELECT COUNT(*) FROM information_schema.columns
+                WHERE table_name = %s AND column_name = %s
+            """, (table_name, column_name))
+            return cursor.fetchone()[0] > 0
+        
+        # Add email scraping retry tracking columns to stores table if they don't exist
+        if not column_exists('stores', 'email_scraping_attempts'):
+            logger.info("Adding email scraping retry tracking columns to stores table...")
+            cursor.execute("ALTER TABLE stores ADD COLUMN email_scraping_attempts INTEGER DEFAULT 0")
+            cursor.execute("ALTER TABLE stores ADD COLUMN email_scraping_last_error TEXT")
+            cursor.execute("ALTER TABLE stores ADD COLUMN email_scraping_failed_at TIMESTAMP")
+            conn.commit()
+            logger.info("Email scraping retry columns added")
+        
         conn.close()
         logger.info("Database initialized")
     
@@ -316,8 +333,9 @@ class Database:
         conn.close()
         return count
     
-    def get_stores_with_urls_no_emails(self, limit: int = None, app_name: str = None) -> List[Dict]:
-        """Get stores that have URLs but no emails yet (for batch email scraping), optionally for a specific app"""
+    def get_stores_with_urls_no_emails(self, limit: int = None, app_name: str = None, cooldown_minutes: int = 60) -> List[Dict]:
+        """Get stores that have URLs but no emails yet (for batch email scraping), optionally for a specific app.
+        Excludes stores with email_scraping_failed status within cooldown period."""
         conn = self.get_connection()
         cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         
@@ -327,8 +345,13 @@ class Database:
             AND base_url != ''
             AND (status = 'url_verified' OR status = 'url_found')
             AND (emails IS NULL OR emails = '' OR emails = '[]')
+            AND (
+                status != 'email_scraping_failed' 
+                OR email_scraping_failed_at IS NULL 
+                OR email_scraping_failed_at < NOW() - INTERVAL '1 minute' * %s
+            )
         """
-        params = []
+        params = [cooldown_minutes]
         if app_name:
             query += " AND app_name = %s"
             params.append(app_name)
@@ -337,10 +360,7 @@ class Database:
             query += " LIMIT %s"
             params.append(limit)
         
-        if params:
-            cursor.execute(query, params)
-        else:
-            cursor.execute(query)
+        cursor.execute(query, params)
         rows = cursor.fetchall()
         conn.close()
         
@@ -395,32 +415,151 @@ class Database:
         conn.close()
     
     def update_store_emails(self, store_id: int, emails: List[str], raw_emails: Optional[List[str]] = None, scraping_error: Optional[str] = None):
-        """Update store with scraped emails (both cleaned and raw)"""
+        """Update store with scraped emails (both cleaned and raw).
+        Note: If store is marked as email_scraping_failed or email_scraping_permanent_failure,
+        that status is preserved and not overwritten here."""
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        emails_json = json.dumps(emails)
-        raw_emails_json = json.dumps(raw_emails) if raw_emails else None
+        # Check current status - don't overwrite failed/permanent_failure statuses
+        cursor.execute("SELECT status FROM stores WHERE id = %s", (store_id,))
+        current_status_row = cursor.fetchone()
+        current_status = current_status_row[0] if current_status_row else None
         
-        if scraping_error:
-            status = 'url_verified'
-        elif len(emails) > 0:
-            status = 'emails_found'
+        # If already marked as failed or permanent failure, preserve that status
+        if current_status in ('email_scraping_failed', 'email_scraping_permanent_failure'):
+            # Only update emails and timestamps, keep the failed status
+            emails_json = json.dumps(emails)
+            raw_emails_json = json.dumps(raw_emails) if raw_emails else None
+            
+            cursor.execute("""
+                UPDATE stores
+                SET emails = %s, raw_emails = %s, emails_found = %s, emails_scraped_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+            """, (emails_json, raw_emails_json, len(emails), store_id))
         else:
-            status = 'no_emails_found'
-        
-        cursor.execute("""
-            UPDATE stores
-            SET emails = %s, raw_emails = %s, emails_found = %s, emails_scraped_at = CURRENT_TIMESTAMP,
-                status = %s, updated_at = CURRENT_TIMESTAMP
-            WHERE id = %s
-        """, (emails_json, raw_emails_json, len(emails), status, store_id))
+            # Normal update with status change
+            emails_json = json.dumps(emails)
+            raw_emails_json = json.dumps(raw_emails) if raw_emails else None
+            
+            if scraping_error:
+                status = 'url_verified'
+            elif len(emails) > 0:
+                status = 'emails_found'
+            else:
+                status = 'no_emails_found'
+            
+            cursor.execute("""
+                UPDATE stores
+                SET emails = %s, raw_emails = %s, emails_found = %s, emails_scraped_at = CURRENT_TIMESTAMP,
+                    status = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE id = %s
+            """, (emails_json, raw_emails_json, len(emails), status, store_id))
         
         conn.commit()
         conn.close()
         
         if scraping_error:
-            logger.warning(f"Store {store_id} marked as {status} but scraping had errors: {scraping_error}")
+            logger.warning(f"Store {store_id} marked as {current_status or 'url_verified'} but scraping had errors: {scraping_error}")
+    
+    def mark_email_scraping_failed(self, store_id: int, error_type: str, error_message: str):
+        """Mark store as email scraping failed (will retry later after cooldown)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE stores
+            SET status = 'email_scraping_failed',
+                email_scraping_last_error = %s,
+                email_scraping_failed_at = CURRENT_TIMESTAMP,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (f"{error_type}: {error_message}", store_id))
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"Store {store_id} marked as email_scraping_failed: {error_type}")
+    
+    def mark_email_scraping_permanent_failure(self, store_id: int, error_message: str):
+        """Mark store as permanent email scraping failure (after max retries)"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE stores
+            SET status = 'email_scraping_permanent_failure',
+                email_scraping_last_error = %s,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (error_message, store_id))
+        
+        conn.commit()
+        conn.close()
+        logger.warning(f"Store {store_id} marked as email_scraping_permanent_failure: {error_message}")
+    
+    def increment_email_scraping_attempts(self, store_id: int):
+        """Increment the retry attempt counter for email scraping"""
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            UPDATE stores
+            SET email_scraping_attempts = email_scraping_attempts + 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = %s
+        """, (store_id,))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_failed_stores_for_retry(self, cooldown_minutes: int = 60, limit: int = 10, app_name: str = None) -> List[Dict]:
+        """Get stores with email_scraping_failed status that are ready for retry (after cooldown)"""
+        conn = self.get_connection()
+        cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        
+        query = """
+            SELECT * FROM stores
+            WHERE status = 'email_scraping_failed'
+            AND email_scraping_failed_at IS NOT NULL
+            AND email_scraping_failed_at < NOW() - INTERVAL '1 minute' * %s
+        """
+        params = [cooldown_minutes]
+        
+        if app_name:
+            query += " AND app_name = %s"
+            params.append(app_name)
+        
+        query += " ORDER BY email_scraping_failed_at"
+        
+        if limit:
+            query += " LIMIT %s"
+            params.append(limit)
+        
+        cursor.execute(query, params)
+        rows = cursor.fetchall()
+        conn.close()
+        
+        stores = []
+        for row in rows:
+            store = dict(row)
+            if store.get('emails'):
+                try:
+                    store['emails'] = json.loads(store['emails'])
+                except:
+                    store['emails'] = []
+            else:
+                store['emails'] = []
+            if store.get('raw_emails'):
+                try:
+                    store['raw_emails'] = json.loads(store['raw_emails'])
+                except:
+                    store['raw_emails'] = []
+            else:
+                store['raw_emails'] = []
+            stores.append(store)
+        
+        return stores
     
     def get_store(self, store_id: int) -> Optional[Dict]:
         """Get a single store by ID"""

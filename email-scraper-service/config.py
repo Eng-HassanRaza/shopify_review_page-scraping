@@ -53,5 +53,10 @@ EMAIL_AI_MIN_CONFIDENCE = float(os.getenv('EMAIL_AI_MIN_CONFIDENCE', '0.7'))
 # Concurrency settings
 MAX_CONCURRENT_EMAIL_SCRAPING = int(os.getenv('MAX_CONCURRENT_EMAIL_SCRAPING', '10'))
 
+# Email scraping retry settings
+EMAIL_SCRAPING_DNS_ERROR_THRESHOLD = int(os.getenv('EMAIL_SCRAPING_DNS_ERROR_THRESHOLD', '5'))
+EMAIL_SCRAPING_FAILED_COOLDOWN_MINUTES = int(os.getenv('EMAIL_SCRAPING_FAILED_COOLDOWN_MINUTES', '60'))
+EMAIL_SCRAPING_MAX_RETRIES = int(os.getenv('EMAIL_SCRAPING_MAX_RETRIES', '3'))
+
 # User agent for browser
 USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
