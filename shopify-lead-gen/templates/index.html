@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shopify Lead Gen</title>
+  <link rel="stylesheet" href="/static/css/style.css">
+</head>
+<body>
+  <header>
+    <h1>Shopify Lead Gen</h1>
+    <p class="subtitle">Extract contact emails from Shopify App Store reviews</p>
+  </header>
+
+  <main>
+
+    <!-- Section 1: New Job -->
+    <section class="card" id="new-job-section">
+      <h2>New Job</h2>
+      <form id="job-form">
+        <div class="field">
+          <label for="app-url">Shopify App Review URL</label>
+          <input id="app-url" type="url"
+            placeholder="https://apps.shopify.com/klaviyo/reviews"
+            required>
+        </div>
+        <div class="field field-inline">
+          <label for="limit-count">Review limit <span class="hint">(blank = all)</span></label>
+          <input id="limit-count" type="number" min="1" placeholder="e.g. 200" style="width:120px">
+        </div>
+        <button type="submit" id="start-btn" class="btn-primary">Start Scraping</button>
+      </form>
+    </section>
+
+    <!-- Section 2: Progress -->
+    <section class="card hidden" id="progress-section">
+      <div class="progress-header">
+        <h2>Progress — <span id="job-app-name">—</span></h2>
+        <div class="progress-controls">
+          <button id="pause-btn"  class="btn-secondary">Pause</button>
+          <button id="resume-btn" class="btn-secondary hidden">Resume</button>
+        </div>
+      </div>
+
+      <div class="stat-row">
+        <div class="stat">
+          <span class="stat-value" id="stat-reviews">0</span>
+          <span class="stat-label">Reviews found</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-urls">0</span>
+          <span class="stat-label">URLs found</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-emails">0</span>
+          <span class="stat-label">With emails</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="stat-processed">0</span>
+          <span class="stat-label">Processed</span>
+        </div>
+      </div>
+
+      <div class="progress-bar-wrap">
+        <div class="progress-bar" id="progress-bar"></div>
+      </div>
+      <p class="progress-label" id="progress-label">Starting…</p>
+    </section>
+
+    <!-- Section 3: Results -->
+    <section class="card" id="results-section">
+      <div class="results-header">
+        <h2>Results</h2>
+        <div class="results-controls">
+          <select id="job-select">
+            <option value="">— select a job —</option>
+          </select>
+          <button id="export-btn" class="btn-primary" disabled>Export CSV</button>
+        </div>
+      </div>
+
+      <div id="results-table-wrap">
+        <p class="empty-msg">No results yet. Start a job above.</p>
+      </div>
+
+      <div class="pagination hidden" id="pagination">
+        <button id="prev-page" class="btn-secondary">← Prev</button>
+        <span id="page-info">Page 1</span>
+        <button id="next-page" class="btn-secondary">Next →</button>
+      </div>
+    </section>
+
+  </main>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script type="module" src="/static/js/api.js"></script>
+  <script type="module" src="/static/js/job.js"></script>
+  <script type="module" src="/static/js/results.js"></script>
+  <script type="module" src="/static/js/app.js"></script>
+</body>
+</html>
