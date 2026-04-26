@@ -144,12 +144,15 @@ class ReviewScraper:
 
         return reviews
 
-    def scrape(self, review_url: str, limit: int = 0) -> Generator[List[Dict], None, None]:
+    def scrape(
+        self, review_url: str, limit: int = 0, start_page: int = 1
+    ) -> Generator[tuple, None, None]:
         """
-        Yield batches of review dicts page-by-page.
-        Stops when limit is reached (0 = no limit) or pages run out.
+        Yield (page_number, batch) tuples page-by-page.
+
+        limit  — max NEW stores to insert this run (0 = no limit); caller tracks this.
+        start_page — first page to fetch (for cursor-based resumption).
         """
-        # Rating embedded in URL (e.g. ?rating=5) as fallback
         url_rating = None
         try:
             qs = parse_qs(urlparse(review_url).query)
@@ -158,14 +161,10 @@ class ReviewScraper:
         except Exception:
             pass
 
-        total = 0
         empty_streak = 0
-        page = 1
+        page = start_page
 
         while True:
-            if limit and total >= limit:
-                break
-
             sep = "&" if "?" in review_url else "?"
             page_url = f"{review_url}{sep}page={page}"
 
@@ -186,13 +185,7 @@ class ReviewScraper:
                     break
             else:
                 empty_streak = 0
-                if limit and total + len(batch) > limit:
-                    batch = batch[: limit - total]
-                total += len(batch)
-                logger.info("Page %d: %d reviews (total %d)", page, len(batch), total)
-                yield batch
-
-                if limit and total >= limit:
-                    break
+                logger.info("Page %d: %d reviews", page, len(batch))
+                yield page, batch
 
             page += 1

@@ -19,5 +19,6 @@ export const api = {
   pauseJob:   (id)       => _req("POST", `/api/jobs/${id}/pause`),
   resumeJob:  (id)       => _req("POST", `/api/jobs/${id}/resume`),
   getStores:  (id, page, perPage) => _req("GET", `/api/jobs/${id}/stores?page=${page}&per_page=${perPage}`),
+  deleteJob:  (id)       => _req("DELETE", `/api/jobs/${id}`),
   exportUrl:  (id)       => `/api/jobs/${id}/export`,
 };

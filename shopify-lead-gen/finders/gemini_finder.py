@@ -19,6 +19,8 @@ _IGNORED_HOSTS = (
     "facebook.com", "instagram.com", "tiktok.com",
     "twitter.com", "x.com", "linkedin.com", "youtube.com",
     "pinterest.com", "wikipedia.org", "amazon.", "aliexpress.",
+    "etsy.com", "ebay.com", "walmart.com", "apps.shopify.com",
+    "shopify.com/blog", "help.shopify.com",
 )
 
 
@@ -76,20 +78,63 @@ class GeminiFinder:
         if not store_name:
             return None, 0.0
 
-        prompt = (
-            "Find the official Shopify storefront homepage URL for this store.\n"
-            "Use Google Search to verify. Prefer the main homepage, not social profiles, "
-            "directories, or app stores.\n\n"
-            "Return EXACTLY this format (no extra lines):\n"
-            "SELECTED_URL: <url>\n"
-            "CONFIDENCE: <0.0 to 1.0>\n"
-            "REASONING: <one sentence>\n\n"
-            f"store_name: {store_name}\n"
-            f"country: {country or 'unknown'}\n"
-        )
+        # Primary attempt
+        url, confidence = self._query(store_name, country, attempt=1)
+
+        # Fallback: if confidence is below threshold, retry with a different query angle
+        if (url is None or confidence is None or confidence < config.URL_CONFIDENCE_THRESHOLD):
+            logger.info("GeminiFinder: primary attempt low confidence (%.2f), trying fallback query", confidence or 0.0)
+            url2, conf2 = self._query(store_name, country, attempt=2)
+            if conf2 is not None and conf2 > (confidence or 0.0):
+                url, confidence = url2, conf2
+                logger.info("GeminiFinder: fallback improved confidence to %.2f", confidence)
+
+        if url and _is_ignored(url):
+            url = None
+
+        if url is None:
+            confidence = 0.0
+        elif confidence is None:
+            confidence = 0.5
+
+        logger.info("GeminiFinder store=%r → url=%s conf=%.2f", store_name, url, float(confidence))
+        return url, float(confidence)
+
+    def _query(self, store_name: str, country: str, attempt: int) -> Tuple[Optional[str], Optional[float]]:
+        if attempt == 1:
+            prompt = (
+                "You are a research assistant finding e-commerce store websites.\n\n"
+                f"Find the official online store / e-commerce homepage URL for this Shopify merchant:\n"
+                f"Store Name: {store_name}\n"
+                f"Country: {country or 'unknown'}\n\n"
+                "Instructions:\n"
+                "- Use Google Search to find their actual website\n"
+                "- Prefer their main homepage (e.g. https://storename.com), NOT social profiles, NOT marketplaces like Amazon/Etsy/eBay\n"
+                "- If they sell on Shopify, the URL often ends in .myshopify.com OR they have a custom domain\n"
+                "- Only return a URL you are confident belongs to this specific store\n\n"
+                "Return EXACTLY this format (no extra lines, no markdown):\n"
+                "SELECTED_URL: <url or NONE>\n"
+                "CONFIDENCE: <0.0 to 1.0>\n"
+                "REASONING: <one sentence>\n"
+            )
+        else:
+            # Fallback: narrower Shopify-specific search
+            prompt = (
+                "You are a research assistant. Search Google specifically for:\n"
+                f'site:myshopify.com OR shopify "{store_name}"\n\n'
+                f"Store Name: {store_name}\n"
+                f"Country: {country or 'unknown'}\n\n"
+                "Find the Shopify storefront URL. The URL should look like:\n"
+                "- https://store-name.myshopify.com  OR\n"
+                "- https://www.storename.com (custom domain Shopify store)\n\n"
+                "Return EXACTLY this format:\n"
+                "SELECTED_URL: <url or NONE>\n"
+                "CONFIDENCE: <0.0 to 1.0>\n"
+                "REASONING: <one sentence>\n"
+            )
 
         last_err = None
-        for attempt in range(config.GEMINI_MAX_RETRIES + 1):
+        for retry in range(config.GEMINI_MAX_RETRIES + 1):
             try:
                 response = self._client.models.generate_content(
                     model=config.GEMINI_MODEL,
@@ -103,14 +148,14 @@ class GeminiFinder:
                 break
             except errors.ClientError as e:
                 last_err = e
-                if self._is_rate_limit(e) and attempt < config.GEMINI_MAX_RETRIES:
-                    self._backoff(attempt)
+                if self._is_rate_limit(e) and retry < config.GEMINI_MAX_RETRIES:
+                    self._backoff(retry)
                     continue
                 raise
             except Exception as e:
                 last_err = e
-                if self._is_rate_limit(e) and attempt < config.GEMINI_MAX_RETRIES:
-                    self._backoff(attempt)
+                if self._is_rate_limit(e) and retry < config.GEMINI_MAX_RETRIES:
+                    self._backoff(retry)
                     continue
                 raise
         else:
@@ -124,13 +169,7 @@ class GeminiFinder:
         if url and _is_ignored(url):
             url = None
 
-        if url is None:
-            confidence = 0.0
-        elif confidence is None:
-            confidence = 0.5
-
-        logger.info("GeminiFinder store=%r → url=%s conf=%.2f", store_name, url, confidence)
-        return url, float(confidence)
+        return url, confidence
 
     @staticmethod
     def _is_rate_limit(exc: Exception) -> bool:
@@ -139,6 +178,6 @@ class GeminiFinder:
 
     @staticmethod
     def _backoff(attempt: int) -> None:
-        delay = min(config.GEMINI_RETRY_DELAY * (2 ** attempt), 30.0)
+        delay = min(config.GEMINI_RETRY_DELAY * (2 ** attempt), 60.0)
         logger.warning("Gemini 429 — retrying in %.1fs (attempt %d)", delay, attempt + 1)
         time.sleep(delay)

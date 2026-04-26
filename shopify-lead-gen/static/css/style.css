@@ -90,6 +90,9 @@ main {
 .btn-primary:disabled { opacity: .5; cursor: not-allowed; }
 .btn-secondary { background: var(--surface); border-color: var(--border); color: var(--text); }
 .btn-secondary:hover { background: var(--bg); }
+.btn-danger { background: var(--danger); color: #fff; }
+.btn-danger:hover { background: #b91c1c; }
+.btn-danger:disabled { opacity: .5; cursor: not-allowed; }
 
 /* Progress section */
 .progress-header {
