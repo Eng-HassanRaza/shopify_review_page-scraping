@@ -176,3 +176,4 @@ logs/
 # Local configuration overrides
 config.local.py
 settings.local.py
+.claude
