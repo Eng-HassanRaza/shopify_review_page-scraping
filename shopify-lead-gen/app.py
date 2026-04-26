@@ -42,8 +42,19 @@ def create_job():
         except (TypeError, ValueError):
             limit_count = None
 
-    app_name = extract_app_name(app_url)
-    job = db.create_job(app_url=app_url, app_name=app_name, limit_count=limit_count)
+    # Reuse existing job for the same app URL so results accumulate in one record
+    existing = db.find_job_by_url(app_url)
+    if existing:
+        job_id = existing["id"]
+        if pipeline.is_running(job_id):
+            return jsonify({"error": "A job for this URL is already running"}), 409
+        job = db.restart_job(job_id, limit_count=limit_count)
+        logger.info("Reusing existing job #%d for %s", job_id, app_url)
+    else:
+        app_name = extract_app_name(app_url)
+        job = db.create_job(app_url=app_url, app_name=app_name, limit_count=limit_count)
+        logger.info("Created new job #%d for %s", job["id"], app_url)
+
     pipeline.start_job(job["id"])
     return jsonify(job), 201
 
@@ -59,6 +70,17 @@ def get_job(job_id: int):
     if not status:
         return jsonify({"error": "not found"}), 404
     return jsonify(status)
+
+
+@app.delete("/api/jobs/<int:job_id>")
+def delete_job(job_id: int):
+    job = db.get_job(job_id)
+    if not job:
+        return jsonify({"error": "not found"}), 404
+    if pipeline.is_running(job_id):
+        pipeline.stop_job(job_id)
+    db.delete_job(job_id)
+    return jsonify({"ok": True})
 
 
 @app.post("/api/jobs/<int:job_id>/pause")

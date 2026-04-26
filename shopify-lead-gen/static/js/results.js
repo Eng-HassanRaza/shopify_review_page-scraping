@@ -12,6 +12,7 @@ export async function initResults() {
   await refreshJobSelector();
   document.getElementById("job-select").addEventListener("change", onJobSelect);
   document.getElementById("export-btn").addEventListener("click", onExport);
+  document.getElementById("delete-job-btn").addEventListener("click", onDeleteJob);
   document.getElementById("prev-page").addEventListener("click", () => changePage(_page - 1));
   document.getElementById("next-page").addEventListener("click", () => changePage(_page + 1));
 }
@@ -39,6 +40,7 @@ export async function loadJobResults(jobId) {
   _page  = 1;
   document.getElementById("job-select").value = jobId;
   document.getElementById("export-btn").disabled = false;
+  document.getElementById("delete-job-btn").disabled = false;
   await fetchAndRender();
   // Refresh selector so counts update
   refreshJobSelector(jobId);
@@ -70,7 +72,8 @@ function renderTable(stores) {
   }
 
   const rows = stores.map(s => {
-    const emails = (s.emails || []).join(", ") || "—";
+    const emailArr = Array.isArray(s.emails) ? s.emails : [];
+    const emails = emailArr.join(", ") || "—";
     const url    = s.store_url ? `<a href="${s.store_url}" target="_blank">${_trunc(s.store_url, 30)}</a>` : "—";
     return `<tr>
       <td title="${_esc(s.store_name)}">${_esc(_trunc(s.store_name, 28))}</td>
@@ -107,6 +110,27 @@ function renderPagination() {
 function onExport() {
   if (!_jobId) return;
   window.location.href = api.exportUrl(_jobId);
+}
+
+async function onDeleteJob() {
+  if (!_jobId) return;
+  const sel = document.getElementById("job-select");
+  const label = sel.options[sel.selectedIndex]?.text || `Job #${_jobId}`;
+  if (!confirm(`Delete all data for "${label}"?\n\nThis cannot be undone.`)) return;
+  try {
+    await api.deleteJob(_jobId);
+    toast("Job deleted.");
+    _jobId = null;
+    _page  = 1;
+    _total = 0;
+    document.getElementById("export-btn").disabled = true;
+    document.getElementById("delete-job-btn").disabled = true;
+    document.getElementById("results-table-wrap").innerHTML = "";
+    document.getElementById("pagination").classList.add("hidden");
+    await refreshJobSelector();
+  } catch (err) {
+    toast("Delete failed: " + err.message);
+  }
 }
 
 function _badge(status) {

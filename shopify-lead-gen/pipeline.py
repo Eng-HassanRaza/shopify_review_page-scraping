@@ -6,11 +6,13 @@ Control via start_job() / stop_job() / get_status().
 """
 import logging
 import threading
+import time
 from typing import Dict, Optional
 
 import config
 import database as db
 from finders.gemini_finder import GeminiFinder
+from finders.gemini_email_finder import GeminiEmailFinder
 from scrapers.email_scraper import EmailScraper
 from scrapers.review_scraper import ReviewScraper, extract_app_name
 from utils.ai_email_filter import AIEmailFilter
@@ -29,12 +31,14 @@ _lock = threading.Lock()
 def start_job(job_id: int) -> None:
     with _lock:
         if job_id in _stop_events:
-            return  # already running
+            logger.info("Job %d is already running — ignoring start request", job_id)
+            return
         event = threading.Event()
         _stop_events[job_id] = event
 
-    t = threading.Thread(target=_run_job, args=(job_id, event), daemon=True)
+    t = threading.Thread(target=_run_job, args=(job_id, event), daemon=True, name=f"job-{job_id}")
     t.start()
+    logger.info("Job %d started (thread %s)", job_id, t.name)
 
 
 def stop_job(job_id: int) -> None:
@@ -42,6 +46,7 @@ def stop_job(job_id: int) -> None:
         ev = _stop_events.get(job_id)
     if ev:
         ev.set()
+        logger.info("Job %d stop signal sent", job_id)
 
 
 def is_running(job_id: int) -> bool:
@@ -66,138 +71,300 @@ def _should_stop(event: threading.Event) -> bool:
     return event.is_set()
 
 
+def _upsert_batch(job_id: int, batch: list) -> tuple:
+    """Insert a batch of review dicts. Returns (inserted, skipped)."""
+    inserted = skipped = 0
+    for review in batch:
+        store_id = db.upsert_store(job_id, review)
+        if store_id:
+            inserted += 1
+        else:
+            skipped += 1
+    return inserted, skipped
+
+
 def _run_job(job_id: int, stop: threading.Event) -> None:
+    logger.info("=" * 60)
+    logger.info("Job %d: pipeline starting", job_id)
     try:
         db.update_job(job_id, status="running")
         job = db.get_job(job_id)
         limit = job.get("limit_count") or 0
+        app_url = job["app_url"]
 
-        finder = GeminiFinder()
+        logger.info("Job %d: app_url=%s  limit=%s", job_id, app_url, limit or "unlimited")
+
+        # Init components — fail fast if API keys are missing
+        logger.info("Job %d: initialising Gemini finder…", job_id)
+        try:
+            finder = GeminiFinder()
+            logger.info("Job %d: Gemini finder ready (model=%s)", job_id, config.GEMINI_MODEL)
+        except Exception as e:
+            logger.error("Job %d: FAILED to init Gemini finder: %s", job_id, e)
+            db.update_job(job_id, status="failed", error=f"Gemini init failed: {e}")
+            return
+
+        try:
+            gemini_email_finder = GeminiEmailFinder()
+            logger.info("Job %d: Gemini email finder ready", job_id)
+        except Exception as e:
+            logger.warning("Job %d: Gemini email finder init failed: %s — AI email search disabled", job_id, e)
+            gemini_email_finder = None
+
         email_scraper = EmailScraper()
         ai_filter = _build_ai_filter()
         review_scraper = ReviewScraper()
 
-        app_name = job.get("app_name") or extract_app_name(job["app_url"])
+        app_name = job.get("app_name") or extract_app_name(app_url)
         db.update_job(job_id, app_name=app_name)
 
-        # --- Phase 1: scrape reviews and immediately process each batch ---
-        total_reviews = 0
-        for batch in review_scraper.scrape(job["app_url"], limit=limit):
+        cursor = job.get("scrape_cursor", 0)
+        total_reviews = job.get("total_reviews_found", 0)  # cumulative across runs
+        inserted_this_run = 0
+
+        # ----------------------------------------------------------------
+        # Phase A: new review sweep from page 1 (only when resuming)
+        # Scan forward until we hit a page that contains an already-known
+        # store — that's the boundary between new and old content.
+        # ----------------------------------------------------------------
+        if cursor > 0:
+            logger.info("Job %d: [Phase A] sweeping from page 1 for new reviews (cursor=%d)", job_id, cursor)
+            for page, batch in review_scraper.scrape(app_url, start_page=1):
+                if _should_stop(stop):
+                    db.update_job(job_id, status="paused")
+                    return
+
+                inserted, skipped = _upsert_batch(job_id, batch)
+                inserted_this_run += inserted
+                total_reviews += len(batch)
+                db.update_job(job_id, total_reviews_found=total_reviews)
+                logger.info(
+                    "Job %d: [Phase A] page %d — new=%d dup=%d run_total=%d",
+                    job_id, page, inserted, skipped, inserted_this_run,
+                )
+
+                _process_pending(job_id, stop, finder, gemini_email_finder, email_scraper, ai_filter, drain=False)
+                if _should_stop(stop):
+                    db.update_job(job_id, status="paused")
+                    return
+
+                if limit and inserted_this_run >= limit:
+                    db.update_job(job_id, status="paused")
+                    return
+
+                # Found existing reviews on this page → we've reached the old boundary.
+                # Jump to Phase B from cursor+1.
+                if skipped > 0:
+                    logger.info(
+                        "Job %d: [Phase A] boundary hit at page %d — jumping to cursor+1=%d",
+                        job_id, page, cursor + 1,
+                    )
+                    break
+
+                # Phase A naturally advanced past the cursor (lots of new reviews).
+                # Phase B will start right after the last Phase A page.
+                if page >= cursor:
+                    cursor = page
+                    logger.info("Job %d: [Phase A] passed cursor naturally at page %d", job_id, page)
+                    break
+
+        # ----------------------------------------------------------------
+        # Phase B: continue from cursor+1 (main forward scrape)
+        # ----------------------------------------------------------------
+        logger.info("Job %d: [Phase B] resuming from page %d", job_id, cursor + 1)
+        for page, batch in review_scraper.scrape(app_url, start_page=cursor + 1):
             if _should_stop(stop):
                 db.update_job(job_id, status="paused")
                 return
 
-            inserted = 0
-            for review in batch:
-                store_id = db.upsert_store(job_id, review)
-                if store_id:
-                    inserted += 1
-
+            inserted, skipped = _upsert_batch(job_id, batch)
+            inserted_this_run += inserted
             total_reviews += len(batch)
             db.update_job(job_id, total_reviews_found=total_reviews)
 
-            # Process newly inserted stores immediately (interleaved pipeline)
-            _process_pending(job_id, stop, finder, email_scraper, ai_filter)
+            # Advance cursor after each completed page
+            db.update_scrape_cursor(job_id, page)
+
+            logger.info(
+                "Job %d: [Phase B] page %d — new=%d dup=%d run_total=%d",
+                job_id, page, inserted, skipped, inserted_this_run,
+            )
+
+            _process_pending(job_id, stop, finder, gemini_email_finder, email_scraper, ai_filter, drain=False)
             if _should_stop(stop):
                 db.update_job(job_id, status="paused")
                 return
 
-        # --- Final pass: process any stores still pending ---
-        _process_pending(job_id, stop, finder, email_scraper, ai_filter, drain=True)
+            if limit and inserted_this_run >= limit:
+                logger.info("Job %d: [Phase B] limit=%d reached after %d new stores", job_id, limit, inserted_this_run)
+                break
+
+        logger.info("Job %d: review scraping done — %d new stores this run, %d total", job_id, inserted_this_run, total_reviews)
+
+        # ----------------------------------------------------------------
+        # Phase 2+3: drain all remaining pending stores
+        # ----------------------------------------------------------------
+        pending_count = db.count_pending(job_id)
+        logger.info("Job %d: [Phase 2+3] draining %d pending stores", job_id, pending_count)
+        _process_pending(job_id, stop, finder, gemini_email_finder, email_scraper, ai_filter, drain=True)
 
         if _should_stop(stop):
+            logger.info("Job %d: stop requested after drain", job_id)
             db.update_job(job_id, status="paused")
         else:
+            final_stats = db.get_job_stats(job_id)
+            logger.info(
+                "Job %d: COMPLETED — emails_found=%s  no_emails=%s  url_not_found=%s  failed=%s",
+                job_id,
+                final_stats.get("emails_found", 0),
+                final_stats.get("no_emails", 0),
+                final_stats.get("url_not_found", 0),
+                final_stats.get("failed", 0),
+            )
             db.update_job(job_id, status="completed")
 
     except Exception as e:
-        logger.error("Job %d failed: %s", job_id, e, exc_info=True)
+        logger.error("Job %d: UNHANDLED ERROR: %s", job_id, e, exc_info=True)
         db.update_job(job_id, status="failed", error=str(e))
     finally:
         with _lock:
             _stop_events.pop(job_id, None)
+        logger.info("Job %d: pipeline thread exiting", job_id)
+        logger.info("=" * 60)
 
 
 def _process_pending(
     job_id: int,
     stop: threading.Event,
     finder: GeminiFinder,
+    gemini_email_finder: Optional["GeminiEmailFinder"],
     email_scraper: EmailScraper,
     ai_filter: Optional["AIEmailFilter"],
     drain: bool = False,
 ) -> None:
-    """Process all stores currently in 'pending' status."""
+    processed = 0
     while True:
         if _should_stop(stop):
             return
 
         store = db.get_next_pending_store(job_id)
         if not store:
-            break  # nothing left to process right now
+            if drain:
+                logger.info("Job %d: no more pending stores", job_id)
+            break
 
-        _process_store(store, finder, email_scraper, ai_filter)
-
-        processed = db.get_job(job_id).get("stores_processed", 0) + 1
-        db.update_job(job_id, stores_processed=processed)
+        logger.info(
+            "Job %d: processing store #%d %r (drain=%s)",
+            job_id, store["id"], store["store_name"], drain,
+        )
+        _process_store(store, finder, gemini_email_finder, email_scraper, ai_filter)
+        db.increment_stores_processed(job_id)
+        processed += 1
 
         if not drain:
-            break  # in interleaved mode, process one then check for new scraped reviews
+            break  # interleaved mode: process one then let the review loop continue
+
+        # Pace Gemini calls to avoid rate limit cascade
+        if not _should_stop(stop):
+            time.sleep(config.INTER_STORE_DELAY)
+
+    if processed and drain:
+        logger.info("Job %d: drained %d stores in this pass", job_id, processed)
 
 
 def _process_store(
     store: Dict,
     finder: GeminiFinder,
+    gemini_email_finder: Optional["GeminiEmailFinder"],
     email_scraper: EmailScraper,
     ai_filter: Optional["AIEmailFilter"],
 ) -> None:
-    store_id = store["id"]
+    store_id   = store["id"]
     store_name = store["store_name"]
-    country = store.get("country", "")
+    country    = store.get("country") or ""
+    job_id     = store["job_id"]
 
-    # Phase 2: Find URL
+    # Track attempt
+    attempt = db.increment_attempt_count(store_id)
+    logger.info("  Store #%d %r — attempt %d/%d", store_id, store_name, attempt, config.STORE_MAX_ATTEMPTS)
+
+    # ---- Phase 2: Find URL ------------------------------------------------
+    logger.info("  [URL] finding URL for %r (country=%r)", store_name, country)
     try:
         url, confidence = finder.find(store_name, country)
+        logger.info("  [URL] result: url=%s  confidence=%.2f  threshold=%.2f",
+                    url, confidence, config.URL_CONFIDENCE_THRESHOLD)
     except Exception as e:
-        logger.warning("URL finding failed for %r: %s", store_name, e)
-        db.update_store(store_id, status="failed", error=f"URL finder: {e}")
+        logger.error("  [URL] FAILED for %r: %s", store_name, e)
+        _mark_failed_or_retry(store_id, job_id, f"URL finder: {e}", attempt)
         return
 
     if not url or confidence < config.URL_CONFIDENCE_THRESHOLD:
+        logger.info("  [URL] below threshold — marking url_not_found for %r", store_name)
         db.update_store(store_id, status="url_not_found", store_url=url, url_confidence=confidence)
         return
 
     db.update_store(store_id, status="url_found", store_url=url, url_confidence=confidence)
 
-    # Phase 3: Scrape emails
+    # ---- Phase 3: Scrape emails -------------------------------------------
+    logger.info("  [EMAIL] scraping %s for %r", url, store_name)
     try:
         raw_emails = email_scraper.scrape(url)
+        logger.info("  [EMAIL] found %d raw emails: %s", len(raw_emails), raw_emails)
     except Exception as e:
-        logger.warning("Email scraping failed for %s: %s", url, e)
-        db.update_store(store_id, status="failed", error=f"Email scraper: {e}")
+        logger.error("  [EMAIL] FAILED for %s: %s", url, e)
+        _mark_failed_or_retry(store_id, job_id, f"Email scraper: {e}", attempt)
         return
 
+    # ---- Gemini email search fallback ------------------------------------
+    if not raw_emails and gemini_email_finder:
+        logger.info("  [EMAIL] web scrape found nothing — trying Gemini email search for %r", store_name)
+        try:
+            gemini_emails = gemini_email_finder.find(store_name, store_url=url)
+            if gemini_emails:
+                logger.info("  [EMAIL] Gemini found %d email(s): %s", len(gemini_emails), gemini_emails)
+                raw_emails = gemini_emails
+        except Exception as e:
+            logger.warning("  [EMAIL] Gemini email search failed (%s) — continuing with no emails", e)
+
     if not raw_emails:
+        logger.info("  [EMAIL] no emails found at %s", url)
         db.update_store(store_id, status="no_emails", emails=[])
         return
 
-    emails = raw_emails
+    # ---- AI filter --------------------------------------------------------
+    final_emails = raw_emails
     if ai_filter:
+        logger.info("  [AI] filtering %d raw emails…", len(raw_emails))
         try:
-            emails = ai_filter.filter(raw_emails, store_url=url, store_name=store_name)
+            filtered = ai_filter.filter(raw_emails, store_url=url, store_name=store_name)
+            final_emails = filtered or raw_emails
+            logger.info("  [AI] %d → %d emails after filter", len(raw_emails), len(final_emails))
         except Exception as e:
-            logger.warning("AI filter failed for %s: %s — using raw emails", url, e)
+            logger.warning("  [AI] filter failed (%s) — keeping raw emails", e)
 
-    final_emails = emails or raw_emails
     db.update_store(store_id, status="emails_found", emails=final_emails)
-    logger.info("Store %r → %d email(s)", store_name, len(final_emails))
+    logger.info("  Store %r done → %d email(s): %s", store_name, len(final_emails), final_emails)
+
+
+def _mark_failed_or_retry(store_id: int, job_id: int, error: str, attempt: int) -> None:
+    """Mark store as failed permanently, or reset to pending if under retry limit."""
+    if attempt < config.STORE_MAX_ATTEMPTS:
+        logger.info("  Store #%d: attempt %d/%d failed (%s) — will retry", store_id, attempt, config.STORE_MAX_ATTEMPTS, error)
+        db.update_store(store_id, status="pending", error=error)
+    else:
+        logger.warning("  Store #%d: exhausted %d attempts — marking failed: %s", store_id, attempt, error)
+        db.update_store(store_id, status="failed", error=error)
 
 
 def _build_ai_filter() -> Optional["AIEmailFilter"]:
     if not config.OPENAI_API_KEY:
-        logger.info("OPENAI_API_KEY not set — skipping AI email filter")
+        logger.info("OPENAI_API_KEY not set — AI email filter disabled")
         return None
     try:
-        return AIEmailFilter()
+        f = AIEmailFilter()
+        logger.info("AI email filter ready (model=%s)", config.OPENAI_MODEL)
+        return f
     except Exception as e:
         logger.warning("Could not init AIEmailFilter: %s", e)
         return None
