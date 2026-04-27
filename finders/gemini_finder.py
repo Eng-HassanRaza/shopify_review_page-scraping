@@ -17,14 +17,32 @@ from utils.url_utils import normalize_url
 logger = logging.getLogger(__name__)
 
 _IGNORED_HOSTS = (
+    # Google infrastructure
     "vertexaisearch.cloud.google.com",
     "webcache.googleusercontent.com",
+    "google.com",
+    "bing.com",
+    # Social media
     "facebook.com", "instagram.com", "tiktok.com",
     "twitter.com", "x.com", "linkedin.com", "youtube.com",
-    "pinterest.com", "wikipedia.org", "amazon.", "aliexpress.",
-    "etsy.com", "ebay.com", "walmart.com", "apps.shopify.com",
-    "shopify.com", "google.com", "yelp.com", "trustpilot.com",
-    "businessinsider.com", "forbes.com",
+    "pinterest.com", "snapchat.com",
+    # Forums / Q&A / community
+    "reddit.com", "quora.com", "tumblr.com",
+    "stackexchange.com", "stackoverflow.com",
+    # Blogging platforms (not the store's own site)
+    "medium.com", "substack.com", "blogspot.com", "wordpress.com",
+    # Encyclopaedias / news
+    "wikipedia.org", "businessinsider.com", "forbes.com",
+    "techcrunch.com", "buzzfeed.com", "huffpost.com",
+    # Marketplaces
+    "amazon.", "aliexpress.", "etsy.com", "ebay.com",
+    "walmart.com", "wish.com", "dhgate.com", "alibaba.com",
+    # Review / directory sites
+    "yelp.com", "trustpilot.com", "sitejabber.com",
+    "bbb.org", "glassdoor.com", "indeed.com",
+    "yellowpages.com", "foursquare.com",
+    # Shopify's own domains (we want the merchant's site, not Shopify)
+    "apps.shopify.com", "shopify.com",
 )
 
 

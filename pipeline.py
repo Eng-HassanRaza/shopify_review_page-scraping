@@ -441,10 +441,25 @@ def _obvious_match(store_name: str, result: dict) -> tuple:
     Returns ("", 0.0) if no obvious match.
     """
     _SKIP_DOMAINS = (
-        "amazon.", "etsy.", "ebay.", "facebook.", "instagram.", "yelp.",
-        "trustpilot.", "google.", "shopify.com", "apps.shopify",
-        "linkedin.", "twitter.", "tiktok.", "pinterest.",
-        "yellowpages.", "bing.", "wikipedia.",
+        # Social media
+        "facebook.", "instagram.", "tiktok.", "twitter.", "x.com",
+        "linkedin.", "youtube.", "pinterest.", "snapchat.",
+        # Forums / Q&A / community
+        "reddit.", "quora.", "tumblr.",
+        # Blogging platforms
+        "medium.", "substack.", "blogspot.", "wordpress.com",
+        # Encyclopaedias / news
+        "wikipedia.", "businessinsider.", "forbes.", "buzzfeed.",
+        # Marketplaces
+        "amazon.", "aliexpress.", "etsy.", "ebay.",
+        "walmart.", "wish.", "alibaba.",
+        # Review / directory sites
+        "yelp.", "trustpilot.", "sitejabber.",
+        "bbb.org", "yellowpages.", "foursquare.",
+        # Search engines
+        "google.", "bing.",
+        # Shopify's own domains
+        "apps.shopify", "shopify.com",
     )
 
     link    = (result.get("link") or "").lower()

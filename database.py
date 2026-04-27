@@ -380,11 +380,19 @@ def get_job_stats(job_id: int) -> Dict:
 # ---------------------------------------------------------------------------
 
 def upsert_store(job_id: int, data: Dict) -> Optional[int]:
-    """Insert store; skip silently on duplicate (same job + store_name)."""
+    """
+    Insert store; if a row with the same (job_id, store_name) already exists,
+    backfill any blank review-metadata fields (country, rating, review_text,
+    review_date, usage_duration) so re-runs enrich existing records.
+
+    Returns the store id when the row is newly inserted, None when it already existed.
+    The caller uses None to count the store as a duplicate (skipped).
+    """
     conn = _connect()
     try:
         with conn:
             with conn.cursor() as cur:
+                # Try fresh insert first
                 cur.execute(
                     """
                     INSERT INTO stores
@@ -404,7 +412,32 @@ def upsert_store(job_id: int, data: Dict) -> Optional[int]:
                     ),
                 )
                 row = cur.fetchone()
-                return row[0] if row else None
+                if row:
+                    return row[0]  # newly inserted
+
+                # Row already exists — backfill blank fields from the incoming data
+                # so that re-runs fix missing country / rating / review text.
+                country      = data.get("country") or None
+                rating       = data.get("rating")
+                review_text  = data.get("review_text") or None
+                review_date  = data.get("review_date") or None
+                usage_dur    = data.get("usage_duration") or None
+
+                if any(v is not None for v in (country, rating, review_text, review_date, usage_dur)):
+                    cur.execute(
+                        """
+                        UPDATE stores SET
+                            country        = COALESCE(NULLIF(country, ''),        %s),
+                            rating         = COALESCE(rating,                     %s),
+                            review_text    = COALESCE(NULLIF(review_text, ''),    %s),
+                            review_date    = COALESCE(NULLIF(review_date, ''),    %s),
+                            usage_duration = COALESCE(NULLIF(usage_duration, ''), %s)
+                        WHERE job_id = %s AND store_name = %s
+                        """,
+                        (country, rating, review_text, review_date, usage_dur, job_id, data["store_name"]),
+                    )
+
+                return None  # existing store — caller counts as skipped
     finally:
         conn.close()
 
