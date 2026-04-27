@@ -13,9 +13,11 @@ import config
 import database as db
 from finders.gemini_finder import GeminiFinder
 from finders.gemini_email_finder import GeminiEmailFinder
+from finders.serper_search import SerperSearch
 from scrapers.email_scraper import EmailScraper
 from scrapers.review_scraper import ReviewScraper, extract_app_name
 from utils.ai_email_filter import AIEmailFilter
+from utils.country_utils import country_to_iso_code
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +97,15 @@ def _run_job(job_id: int, stop: threading.Event) -> None:
         logger.info("Job %d: app_url=%s  limit=%s", job_id, app_url, limit or "unlimited")
 
         # Init components — fail fast if API keys are missing
+        logger.info("Job %d: initialising Serper search…", job_id)
+        try:
+            serper = SerperSearch()
+            logger.info("Job %d: Serper ready (%d key(s))", job_id, len(config.SERPER_API_KEYS))
+        except Exception as e:
+            logger.error("Job %d: FAILED to init Serper: %s", job_id, e)
+            db.update_job(job_id, status="failed", error=f"Serper init failed: {e}")
+            return
+
         logger.info("Job %d: initialising Gemini finder…", job_id)
         try:
             finder = GeminiFinder()
@@ -143,7 +154,7 @@ def _run_job(job_id: int, stop: threading.Event) -> None:
                     job_id, page, inserted, skipped, inserted_this_run,
                 )
 
-                _process_pending(job_id, stop, finder, gemini_email_finder, email_scraper, ai_filter, drain=False)
+                _process_pending(job_id, stop, serper, finder, gemini_email_finder, email_scraper, ai_filter, drain=False)
                 if _should_stop(stop):
                     db.update_job(job_id, status="paused")
                     return
@@ -190,7 +201,7 @@ def _run_job(job_id: int, stop: threading.Event) -> None:
                 job_id, page, inserted, skipped, inserted_this_run,
             )
 
-            _process_pending(job_id, stop, finder, gemini_email_finder, email_scraper, ai_filter, drain=False)
+            _process_pending(job_id, stop, serper, finder, gemini_email_finder, email_scraper, ai_filter, drain=False)
             if _should_stop(stop):
                 db.update_job(job_id, status="paused")
                 return
@@ -206,7 +217,7 @@ def _run_job(job_id: int, stop: threading.Event) -> None:
         # ----------------------------------------------------------------
         pending_count = db.count_pending(job_id)
         logger.info("Job %d: [Phase 2+3] draining %d pending stores", job_id, pending_count)
-        _process_pending(job_id, stop, finder, gemini_email_finder, email_scraper, ai_filter, drain=True)
+        _process_pending(job_id, stop, serper, finder, gemini_email_finder, email_scraper, ai_filter, drain=True)
 
         if _should_stop(stop):
             logger.info("Job %d: stop requested after drain", job_id)
@@ -236,6 +247,7 @@ def _run_job(job_id: int, stop: threading.Event) -> None:
 def _process_pending(
     job_id: int,
     stop: threading.Event,
+    serper: "SerperSearch",
     finder: GeminiFinder,
     gemini_email_finder: Optional["GeminiEmailFinder"],
     email_scraper: EmailScraper,
@@ -257,14 +269,14 @@ def _process_pending(
             "Job %d: processing store #%d %r (drain=%s)",
             job_id, store["id"], store["store_name"], drain,
         )
-        _process_store(store, finder, gemini_email_finder, email_scraper, ai_filter)
+        _process_store(store, serper, finder, gemini_email_finder, email_scraper, ai_filter)
         db.increment_stores_processed(job_id)
         processed += 1
 
         if not drain:
             break  # interleaved mode: process one then let the review loop continue
 
-        # Pace Gemini calls to avoid rate limit cascade
+        # Pace calls to avoid rate limits
         if not _should_stop(stop):
             time.sleep(config.INTER_STORE_DELAY)
 
@@ -274,6 +286,7 @@ def _process_pending(
 
 def _process_store(
     store: Dict,
+    serper: "SerperSearch",
     finder: GeminiFinder,
     gemini_email_finder: Optional["GeminiEmailFinder"],
     email_scraper: EmailScraper,
@@ -288,10 +301,10 @@ def _process_store(
     attempt = db.increment_attempt_count(store_id)
     logger.info("  Store #%d %r — attempt %d/%d", store_id, store_name, attempt, config.STORE_MAX_ATTEMPTS)
 
-    # ---- Phase 2: Find URL ------------------------------------------------
+    # ---- Phase 2: Find URL via Serper + Gemini ----------------------------
     logger.info("  [URL] finding URL for %r (country=%r)", store_name, country)
     try:
-        url, confidence = finder.find(store_name, country)
+        url, confidence = _find_url(store_name, country, serper, finder)
         logger.info("  [URL] result: url=%s  confidence=%.2f  threshold=%.2f",
                     url, confidence, config.URL_CONFIDENCE_THRESHOLD)
     except Exception as e:
@@ -345,6 +358,47 @@ def _process_store(
 
     db.update_store(store_id, status="emails_found", emails=final_emails)
     logger.info("  Store %r done → %d email(s): %s", store_name, len(final_emails), final_emails)
+
+
+def _find_url(
+    store_name: str,
+    country: str,
+    serper: "SerperSearch",
+    finder: GeminiFinder,
+) -> tuple:
+    """
+    Two-step URL finding:
+      1. Serper search (geo-accurate) → top-10 results
+      2. Gemini reasons over those results → picks best URL
+
+    Falls back to a second Serper query (shopify-specific) if first
+    attempt returns low confidence.
+    """
+    country_code = country_to_iso_code(country)
+
+    # Primary query
+    primary_query = f'"{store_name}" store website'
+    results = serper.search(primary_query, country_code=country_code)
+    url, confidence = finder.find_from_results(store_name, country, results)
+
+    logger.info(
+        "  [URL] primary query=%r gl=%r → url=%s conf=%.2f",
+        primary_query, country_code, url, confidence or 0.0,
+    )
+
+    # Fallback: shopify-specific query if below threshold
+    if not url or (confidence or 0.0) < config.URL_CONFIDENCE_THRESHOLD:
+        fallback_query = f'"{store_name}" shopify online store'
+        results2 = serper.search(fallback_query, country_code=country_code)
+        url2, conf2 = finder.find_from_results(store_name, country, results2)
+        logger.info(
+            "  [URL] fallback query=%r gl=%r → url=%s conf=%.2f",
+            fallback_query, country_code, url2, conf2 or 0.0,
+        )
+        if (conf2 or 0.0) > (confidence or 0.0):
+            url, confidence = url2, conf2
+
+    return url, float(confidence or 0.0)
 
 
 def _mark_failed_or_retry(store_id: int, job_id: int, error: str, attempt: int) -> None:

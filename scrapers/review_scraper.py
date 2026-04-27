@@ -9,6 +9,8 @@ from urllib.parse import parse_qs, urlparse
 import requests
 from bs4 import BeautifulSoup
 
+from utils.country_utils import is_date_string
+
 logger = logging.getLogger(__name__)
 
 _HEADERS = {
@@ -97,11 +99,14 @@ class ReviewScraper:
                 if not store_name:
                     continue
 
-                # Country
+                # Country — skip anything that looks like a date or duration
                 country = ""
                 for div in sec.find_all("div", class_=lambda c: c and "tw-text-body-xs" in c):
                     t = div.get_text(strip=True)
-                    if len(t) > 2 and not any(w in t.lower() for w in ("year", "month", "day", "ago", "replied")):
+                    if (len(t) > 2
+                            and not is_date_string(t)
+                            and not any(w in t.lower() for w in
+                                        ("year", "month", "day", "ago", "replied", "about"))):
                         country = t
                         break
 

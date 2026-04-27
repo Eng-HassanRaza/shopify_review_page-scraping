@@ -36,6 +36,14 @@ URL_CONFIDENCE_THRESHOLD = float(os.getenv("URL_CONFIDENCE_THRESHOLD", "0.5"))
 INTER_STORE_DELAY = float(os.getenv("INTER_STORE_DELAY", "3.0"))
 STORE_MAX_ATTEMPTS = int(os.getenv("STORE_MAX_ATTEMPTS", "3"))
 
+# Serper.dev (geo-accurate Google Search)
+# Comma-separated list of API keys — rotated automatically when one is exhausted
+SERPER_API_KEYS: list = [
+    k.strip() for k in os.getenv("SERPER_API_KEYS", "").split(",") if k.strip()
+]
+SERPER_BASE_URL = "https://google.serper.dev/search"
+SERPER_RESULTS  = int(os.getenv("SERPER_RESULTS", "10"))   # results per query
+
 # OpenAI (email filtering)
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY", "")
 OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
