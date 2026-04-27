@@ -28,7 +28,7 @@ DEBUG = os.getenv("DEBUG", "true").lower() in ("1", "true", "yes")
 GEMINI_API_KEY   = os.getenv("GEMINI_API_KEY", "") or os.getenv("GOOGLE_API_KEY", "")
 GEMINI_MODEL     = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 GEMINI_MAX_RETRIES   = int(os.getenv("GEMINI_MAX_RETRIES", "3"))
-GEMINI_RETRY_DELAY   = float(os.getenv("GEMINI_RETRY_DELAY", "2.0"))
+GEMINI_RETRY_DELAY   = float(os.getenv("GEMINI_RETRY_DELAY", "15.0"))
 GEMINI_TIMEOUT   = int(os.getenv("GEMINI_TIMEOUT", "30"))
 URL_CONFIDENCE_THRESHOLD = float(os.getenv("URL_CONFIDENCE_THRESHOLD", "0.5"))
 

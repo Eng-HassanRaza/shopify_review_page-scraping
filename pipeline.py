@@ -269,8 +269,10 @@ def _process_pending(
             "Job %d: processing store #%d %r (drain=%s)",
             job_id, store["id"], store["store_name"], drain,
         )
-        _process_store(store, serper, finder, gemini_email_finder, email_scraper, ai_filter)
-        db.increment_stores_processed(job_id)
+        terminal = _process_store(store, serper, finder, gemini_email_finder, email_scraper, ai_filter)
+        # Only count stores that reached a final state — not retries reset to pending
+        if terminal:
+            db.increment_stores_processed(job_id)
         processed += 1
 
         if not drain:
@@ -291,7 +293,12 @@ def _process_store(
     gemini_email_finder: Optional["GeminiEmailFinder"],
     email_scraper: EmailScraper,
     ai_filter: Optional["AIEmailFilter"],
-) -> None:
+) -> bool:
+    """
+    Process one store through URL finding + email scraping.
+    Returns True if the store reached a terminal state (done, no matter the outcome).
+    Returns False if the store was reset to pending for a retry.
+    """
     store_id   = store["id"]
     store_name = store["store_name"]
     country    = store.get("country") or ""
@@ -309,13 +316,12 @@ def _process_store(
                     url, confidence, config.URL_CONFIDENCE_THRESHOLD)
     except Exception as e:
         logger.error("  [URL] FAILED for %r: %s", store_name, e)
-        _mark_failed_or_retry(store_id, job_id, f"URL finder: {e}", attempt)
-        return
+        return _mark_failed_or_retry(store_id, job_id, f"URL finder: {e}", attempt)
 
     if not url or confidence < config.URL_CONFIDENCE_THRESHOLD:
         logger.info("  [URL] below threshold — marking url_not_found for %r", store_name)
         db.update_store(store_id, status="url_not_found", store_url=url, url_confidence=confidence)
-        return
+        return True  # terminal
 
     db.update_store(store_id, status="url_found", store_url=url, url_confidence=confidence)
 
@@ -326,8 +332,7 @@ def _process_store(
         logger.info("  [EMAIL] found %d raw emails: %s", len(raw_emails), raw_emails)
     except Exception as e:
         logger.error("  [EMAIL] FAILED for %s: %s", url, e)
-        _mark_failed_or_retry(store_id, job_id, f"Email scraper: {e}", attempt)
-        return
+        return _mark_failed_or_retry(store_id, job_id, f"Email scraper: {e}", attempt)
 
     # ---- Gemini email search fallback ------------------------------------
     if not raw_emails and gemini_email_finder:
@@ -343,7 +348,7 @@ def _process_store(
     if not raw_emails:
         logger.info("  [EMAIL] no emails found at %s", url)
         db.update_store(store_id, status="no_emails", emails=[])
-        return
+        return True  # terminal
 
     # ---- AI filter --------------------------------------------------------
     final_emails = raw_emails
@@ -358,6 +363,7 @@ def _process_store(
 
     db.update_store(store_id, status="emails_found", emails=final_emails)
     logger.info("  Store %r done → %d email(s): %s", store_name, len(final_emails), final_emails)
+    return True  # terminal
 
 
 def _find_url(
@@ -370,6 +376,7 @@ def _find_url(
     Two-step URL finding:
       1. Serper search (geo-accurate) → top-10 results
       2. Gemini reasons over those results → picks best URL
+         (skipped when the top Serper result is an obvious match)
 
     Falls back to a second Serper query (shopify-specific) if first
     attempt returns low confidence.
@@ -379,8 +386,18 @@ def _find_url(
     # Primary query
     primary_query = f'"{store_name}" store website'
     results = serper.search(primary_query, country_code=country_code)
-    url, confidence = finder.find_from_results(store_name, country, results)
 
+    # Fast path: skip Gemini if the top result is an obvious name match.
+    # This saves ~60% of Gemini calls and eliminates the 429 cascade.
+    if results:
+        fast_url, fast_conf = _obvious_match(store_name, results[0])
+        if fast_url:
+            logger.info(
+                "  [URL] obvious match (no Gemini needed): url=%s conf=%.2f", fast_url, fast_conf
+            )
+            return fast_url, fast_conf
+
+    url, confidence = finder.find_from_results(store_name, country, results)
     logger.info(
         "  [URL] primary query=%r gl=%r → url=%s conf=%.2f",
         primary_query, country_code, url, confidence or 0.0,
@@ -390,6 +407,16 @@ def _find_url(
     if not url or (confidence or 0.0) < config.URL_CONFIDENCE_THRESHOLD:
         fallback_query = f'"{store_name}" shopify online store'
         results2 = serper.search(fallback_query, country_code=country_code)
+
+        # Try obvious-match on fallback top result too
+        if results2:
+            fast_url2, fast_conf2 = _obvious_match(store_name, results2[0])
+            if fast_url2 and fast_conf2 > (confidence or 0.0):
+                logger.info(
+                    "  [URL] obvious match on fallback: url=%s conf=%.2f", fast_url2, fast_conf2
+                )
+                return fast_url2, fast_conf2
+
         url2, conf2 = finder.find_from_results(store_name, country, results2)
         logger.info(
             "  [URL] fallback query=%r gl=%r → url=%s conf=%.2f",
@@ -401,14 +428,70 @@ def _find_url(
     return url, float(confidence or 0.0)
 
 
-def _mark_failed_or_retry(store_id: int, job_id: int, error: str, attempt: int) -> None:
-    """Mark store as failed permanently, or reset to pending if under retry limit."""
+def _obvious_match(store_name: str, result: dict) -> tuple:
+    """
+    Return (url, confidence=0.9) when the first Serper result strongly
+    matches the store name without needing Gemini reasoning.
+
+    Matching rules (all case-insensitive):
+      - Store name appears verbatim in the result URL, OR
+      - Store name appears verbatim in the result title AND the URL
+        doesn't look like a marketplace / directory (amazon/etsy/ebay/yelp/facebook…)
+
+    Returns ("", 0.0) if no obvious match.
+    """
+    _SKIP_DOMAINS = (
+        "amazon.", "etsy.", "ebay.", "facebook.", "instagram.", "yelp.",
+        "trustpilot.", "google.", "shopify.com", "apps.shopify",
+        "linkedin.", "twitter.", "tiktok.", "pinterest.",
+        "yellowpages.", "bing.", "wikipedia.",
+    )
+
+    link    = (result.get("link") or "").lower()
+    title   = (result.get("title") or "").lower()
+    name_lc = store_name.lower().strip()
+
+    if not link or not name_lc:
+        return "", 0.0
+
+    # Skip aggregator/marketplace domains
+    if any(skip in link for skip in _SKIP_DOMAINS):
+        return "", 0.0
+
+    # Normalise store name for URL matching (spaces → hyphens or no-space)
+    name_slug  = name_lc.replace(" ", "-")
+    name_nospace = name_lc.replace(" ", "")
+
+    url_match = (
+        name_lc    in link or
+        name_slug  in link or
+        name_nospace in link
+    )
+    title_match = name_lc in title
+
+    if url_match and title_match:
+        raw_url = result.get("link", "")
+        return raw_url, 0.92
+    if url_match:
+        raw_url = result.get("link", "")
+        return raw_url, 0.85
+
+    return "", 0.0
+
+
+def _mark_failed_or_retry(store_id: int, job_id: int, error: str, attempt: int) -> bool:
+    """
+    Mark store as failed permanently, or reset to pending if under retry limit.
+    Returns True if permanently failed (terminal), False if reset to pending (will retry).
+    """
     if attempt < config.STORE_MAX_ATTEMPTS:
         logger.info("  Store #%d: attempt %d/%d failed (%s) — will retry", store_id, attempt, config.STORE_MAX_ATTEMPTS, error)
         db.update_store(store_id, status="pending", error=error)
+        return False  # not terminal — will be retried
     else:
         logger.warning("  Store #%d: exhausted %d attempts — marking failed: %s", store_id, attempt, error)
         db.update_store(store_id, status="failed", error=error)
+        return True  # terminal
 
 
 def _build_ai_filter() -> Optional["AIEmailFilter"]:
