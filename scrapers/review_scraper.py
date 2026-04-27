@@ -99,16 +99,31 @@ class ReviewScraper:
                 if not store_name:
                     continue
 
-                # Country — skip anything that looks like a date or duration
+                # Country — the structure is:
+                #   div.tw-text-body-xs (outer container)
+                #     div.tw-text-heading-xs  ← store name (skip)
+                #     div (no class)          ← "Japan"   ← COUNTRY
+                #     div (no class)          ← "2 days using the app"
+                # We walk the direct children of the outer container and take
+                # the first text that isn't a heading, date, or duration.
                 country = ""
-                for div in sec.find_all("div", class_=lambda c: c and "tw-text-body-xs" in c):
-                    t = div.get_text(strip=True)
-                    if (len(t) > 2
-                            and not is_date_string(t)
-                            and not any(w in t.lower() for w in
-                                        ("year", "month", "day", "ago", "replied", "about"))):
-                        country = t
-                        break
+                info_container = sec.find(
+                    "div", class_=lambda c: c and "tw-text-body-xs" in c
+                )
+                if info_container:
+                    for child in info_container.find_all("div", recursive=False):
+                        classes = child.get("class") or []
+                        # Skip the store-name heading div
+                        if any("tw-text-heading-xs" in cls for cls in classes):
+                            continue
+                        t = child.get_text(strip=True)
+                        if (len(t) > 1
+                                and not is_date_string(t)
+                                and not any(w in t.lower() for w in
+                                            ("year", "month", "day", "ago",
+                                             "replied", "about", "using"))):
+                            country = t
+                            break
 
                 # Review text
                 review_text = ""
