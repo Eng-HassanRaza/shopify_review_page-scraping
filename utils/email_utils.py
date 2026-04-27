@@ -11,6 +11,15 @@ _SKIP = (
     ".png@", ".jpg@", ".gif@", ".css@", ".js@",
 )
 
+# HTML / JS entity prefixes that appear when the email scraper picks up
+# text from JSON blobs or mis-encoded HTML (e.g. \u003e → "u003e" literal).
+# These are NOT valid local-part prefixes.
+_ENTITY_PREFIXES = (
+    "u003e", "u003c", "u003e", "u0026", "u002f",
+    "u0022", "u0027", "amp;", "gt;", "lt;",
+    "&gt;", "&lt;", "&amp;",
+)
+
 
 def is_valid_email(email: str) -> bool:
     if not email or "@" not in email:
@@ -38,6 +47,12 @@ def is_valid_email(email: str) -> bool:
 
     email_lower = email.lower()
     if any(s in email_lower for s in _SKIP):
+        return False
+
+    # Reject emails whose local part starts with an HTML / JS entity artifact
+    # (e.g. "u003esupport@..." scraped from a JSON blob containing \u003e)
+    local_lower = local.lower()
+    if any(local_lower.startswith(ent) for ent in _ENTITY_PREFIXES):
         return False
 
     return True

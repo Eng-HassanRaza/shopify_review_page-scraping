@@ -458,6 +458,9 @@ def _obvious_match(store_name: str, result: dict) -> tuple:
         "bbb.org", "yellowpages.", "foursquare.",
         # Search engines
         "google.", "bing.",
+        # Shopify analytics / data-broker sites (not the store itself)
+        "merchantgenius.io", "myip.ms", "similarweb.",
+        "semrush.", "ahrefs.", "spyfu.", "builtwith.", "wappalyzer.",
         # Shopify's own domains
         "apps.shopify", "shopify.com",
     )

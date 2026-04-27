@@ -41,6 +41,10 @@ _IGNORED_HOSTS = (
     "yelp.com", "trustpilot.com", "sitejabber.com",
     "bbb.org", "glassdoor.com", "indeed.com",
     "yellowpages.com", "foursquare.com",
+    # Shopify analytics / data-broker sites (not the store itself)
+    "merchantgenius.io", "myip.ms", "similarweb.com",
+    "semrush.com", "ahrefs.com", "spyfu.com",
+    "builtwith.com", "wappalyzer.com",
     # Shopify's own domains (we want the merchant's site, not Shopify)
     "apps.shopify.com", "shopify.com",
 )
@@ -113,6 +117,7 @@ class GeminiFinder:
         )
 
         last_err = None
+        response = None
         for attempt in range(config.GEMINI_MAX_RETRIES + 1):
             try:
                 response = self._client.models.generate_content(
@@ -124,23 +129,34 @@ class GeminiFinder:
                         # No google_search tool — Gemini only reasons over provided data
                     ),
                 )
+                last_err = None
                 break
-            except errors.ClientError as e:
+            except (errors.ClientError, Exception) as e:
                 last_err = e
                 if self._is_rate_limit(e) and attempt < config.GEMINI_MAX_RETRIES:
                     self._backoff(attempt)
                     continue
-                raise
-            except Exception as e:
-                last_err = e
-                if self._is_rate_limit(e) and attempt < config.GEMINI_MAX_RETRIES:
-                    self._backoff(attempt)
-                    continue
-                raise
-        else:
-            raise ValueError(
-                f"Gemini rate limit exceeded after {config.GEMINI_MAX_RETRIES + 1} attempts"
-            ) from last_err
+                if not self._is_rate_limit(e):
+                    raise  # non-rate-limit errors bubble up immediately
+                # rate limit on final attempt — fall through to graceful degrade
+
+        if last_err is not None:
+            # All retries exhausted on 429 — degrade gracefully:
+            # return the first non-ignored Serper candidate at reduced confidence
+            # rather than failing the store entirely.
+            logger.warning(
+                "GeminiFinder rate limit exhausted for %r — using first Serper candidate",
+                store_name,
+            )
+            for r in candidates:
+                fallback = normalize_url(r["link"])
+                if fallback and not _is_ignored(fallback):
+                    logger.info(
+                        "GeminiFinder store=%r → fallback url=%s conf=0.55 (Gemini unavailable)",
+                        store_name, fallback,
+                    )
+                    return fallback, 0.55
+            return None, 0.0
 
         text = getattr(response, "text", "") or ""
         url, confidence = self._parse_response(text, candidates)
@@ -201,6 +217,9 @@ class GeminiFinder:
 
     @staticmethod
     def _backoff(attempt: int) -> None:
-        delay = min(config.GEMINI_RETRY_DELAY * (2 ** attempt), 60.0)
+        # Hard floor of 15 s so a misconfigured GEMINI_RETRY_DELAY env var
+        # can't cause a 429 storm on the free-tier (15 RPM) plan.
+        configured = config.GEMINI_RETRY_DELAY * (2 ** attempt)
+        delay = min(max(15.0, configured), 120.0)
         logger.warning("Gemini 429 — retrying in %.1fs (attempt %d)", delay, attempt + 1)
         time.sleep(delay)

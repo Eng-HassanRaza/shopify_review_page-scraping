@@ -262,10 +262,12 @@ def find_job_by_url(app_url: str) -> Optional[Dict]:
 def restart_job(job_id: int, limit_count: Optional[int]) -> Dict:
     """
     Prepare an existing job for a new run:
-    - Reset counters and status
+    - Reset counters, status, and scrape_cursor back to 0 so Phase B
+      re-scans review pages from page 1 — this backfills blank country /
+      rating data for stores that were scraped before the HTML parser fix.
     - Update limit_count
-    - Reset failed/processing stores back to pending so they get retried
-    - Leave already-completed stores (emails_found, no_emails, url_not_found) untouched
+    - Reset ALL stores back to pending so the full pipeline re-runs.
+      (completed stores will just re-confirm their URL/emails, which is fast)
     """
     conn = _connect()
     try:
@@ -277,18 +279,22 @@ def restart_job(job_id: int, limit_count: Optional[int]) -> Dict:
                     SET status = 'idle',
                         limit_count = %s,
                         stores_processed = 0,
+                        scrape_cursor = 0,
+                        total_reviews_found = 0,
                         error = NULL,
                         updated_at = NOW()
                     WHERE id = %s
                     """,
                     (limit_count, job_id),
                 )
-                # Reset failed and stuck-processing stores so they're retried
+                # Reset ALL stores to pending so they re-run through URL + email phases.
+                # This ensures completed stores also get their country backfilled when
+                # the review scraper re-encounters them.
                 cur.execute(
                     """
                     UPDATE stores
                     SET status = 'pending', error = NULL, attempt_count = 0, updated_at = NOW()
-                    WHERE job_id = %s AND status IN ('failed', 'processing')
+                    WHERE job_id = %s
                     """,
                     (job_id,),
                 )
